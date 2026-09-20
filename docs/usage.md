@@ -20,6 +20,9 @@ ssh -p 2222 localhost "cat /docs/api-reference.md"
 
 Use `--allowed '*.md,*.txt'` and `--ignore '.git,node_modules'` to constrain the
 served tree from the command line, or configure these rules in `openlore.yml`.
+An explicitly loaded `--config` file replaces (rather than merges with) an
+embedded `openlore.yml`; otherwise the embedded config takes precedence over
+built-in defaults. Command-line flags always win.
 
 ## Connect an agent
 
@@ -103,7 +106,9 @@ openlore export -o ./extracted-docs
     config: ./openlore.yml
 ```
 
-The action produces cross-platform binaries containing the selected docs.
+The action produces cross-platform binaries containing the selected docs. It
+also builds and embeds the dashboard using the repository's Nix-pinned Node
+toolchain. The resulting binary does not require Node at runtime.
 
 ## MCP over HTTP
 
@@ -126,10 +131,14 @@ mcp:
   require_auth: true
 ```
 
-`require_auth: true` forces OAuth login for MCP while retaining the separately
-configured SSH posture. `false` permits anonymous MCP. If omitted, MCP inherits
-the keyless posture. `--mcp-path /custom` changes the path; MCP over HTTP
-requires the HTTP server to remain enabled.
+`require_auth: true` forces OAuth login for both MCP-over-HTTP and the JSON API
+while retaining the separately configured SSH posture. `false` permits
+anonymous access to both HTTP transports. If omitted, both inherit the keyless
+posture. When the posture requires a token but no `tokens` block is configured,
+both transports fail closed and answer every request with 401 (the server logs
+a warning at startup); configure `tokens` or set `require_auth: false`.
+`--mcp-path /custom` changes the MCP path; MCP over HTTP requires the HTTP
+server to remain enabled.
 
 The MCP server exposes:
 
@@ -137,6 +146,27 @@ The MCP server exposes:
 |---|---|
 | `shell` | Execute a command against the virtual filesystem |
 | `list_commands` | List commands supported by that server |
+
+The `shell` tool returns completed command invocations as normal MCP results,
+including when the command exits non-zero. Its structured content keeps
+`stdout`, `stderr`, and `exit_code` separate. The existing `output` field and
+text content contain stdout followed by stderr for compatibility, without a
+synthetic exit-code line. MCP `isError` is reserved for failures of the tool
+invocation itself rather than command exit status.
+
+The plain JSON `POST /api/shell` endpoint and persistent-session
+`POST /api/sessions/{id}/shell` endpoint use the same result contract and
+return HTTP 200 for completed commands:
+
+```json
+{
+  "output": "...",
+  "stdout": "...",
+  "stderr": "...",
+  "is_error": false,
+  "exit_code": 1
+}
+```
 
 ## MCP over stdio
 
@@ -173,9 +203,17 @@ go build -o openlore ./cmd/openlore
 If the binary does not contain embedded docs, installation prompts for a docs
 directory. Pass `--docs-dir ./docs` to bundle one during packaging.
 
+## Browse and edit with VS Code
+
+An SFTP filesystem extension can open OpenLore's directory tree directly in VS
+Code without cloning, mounting, or synchronizing it into a local project
+folder. Saving an editor writes the individual file back through OpenLore's
+governed write path. See [Editing OpenLore Files](editors.md) for VS Code setup,
+other compatible editors, save behavior, and limitations.
+
 ## Mount with SSHFS
 
-SFTP support lets editors and local tools mount the virtual filesystem:
+SFTP also lets local tools mount a read-only view of the virtual filesystem:
 
 ```bash
 mkdir -p /mnt/docs

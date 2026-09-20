@@ -280,6 +280,13 @@ type ReadTracker interface {
 	LastReadHash(path string) (hash string, seen bool)
 }
 
+// ReadContentHasher computes the identity of bytes returned by a filesystem.
+// Unlike ReadTracker's durable CAS identity, this may include presentation-only
+// transforms applied by an outer filesystem wrapper.
+type ReadContentHasher interface {
+	ReadContentHash(path string, content []byte) string
+}
+
 // ErrReadOnly is returned by mutating operations when the substrate is in
 // read-only mode.
 var ErrReadOnly = fmt.Errorf("read-only filesystem")
@@ -358,7 +365,14 @@ func File(name, filePath string, content []byte, modTime time.Time) *FileInfo {
 
 // ErrNotFound is returned when a path does not exist.
 func ErrNotFound(p string) error {
-	return fmt.Errorf("not found: %s", p)
+	return notFoundError{path: p}
+}
+
+type notFoundError struct{ path string }
+
+func (e notFoundError) Error() string { return fmt.Sprintf("not found: %s", e.path) }
+func (e notFoundError) Is(target error) bool {
+	return target == fs.ErrNotExist
 }
 
 // ErrIsDirectory is returned when a file operation is attempted on a directory.

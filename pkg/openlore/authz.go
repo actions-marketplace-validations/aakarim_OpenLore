@@ -2,8 +2,10 @@ package openlore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
+	"path"
 	"sort"
 	"strings"
 	"syscall"
@@ -411,7 +413,13 @@ func (s *Server) identityCanWrite(id Identity, action vfs.ChangeAction, p string
 		return false // token scope ceiling: only full authority may write
 	}
 	p = s.canonicalPath(p)
+	if isDirConfigPath(p) && !s.identityHasDirConfigRole(id, p) {
+		return false
+	}
 	if action == vfs.ChangeActionRemoveAll {
+		if !s.canEditDirConfigsInTree(id, p) {
+			return false
+		}
 		for _, candidate := range s.currentAuth().Docsets {
 			for _, pm := range candidate.Paths {
 				root := displayPath(pm)
@@ -439,6 +447,42 @@ func (s *Server) identityCanWrite(id Identity, action vfs.ChangeAction, p string
 	for _, grant := range grants {
 		if grant.CanWrite(ds, action, p) {
 			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) canEditDirConfigsInTree(id Identity, target string) bool {
+	allowed := true
+	err := vfs.WalkDir(s.merge, target, func(candidate string, _ *vfs.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if isDirConfigPath(candidate) && !s.identityHasDirConfigRole(id, candidate) {
+			allowed = false
+		}
+		return nil
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	return err == nil && allowed
+}
+
+func (s *Server) identityHasDirConfigRole(id Identity, target string) bool {
+	_, docset, ok := s.mostSpecificDocset(path.Dir(path.Dir(target)))
+	if !ok || docset.Config == nil {
+		return false
+	}
+	policy, err := s.currentPolicy(id)
+	if err != nil {
+		return false
+	}
+	for _, allowed := range docset.Config.Edit {
+		for _, role := range policy.Roles {
+			if role == allowed {
+				return true
+			}
 		}
 	}
 	return false
@@ -597,16 +641,18 @@ func (s *scopedReadFS) within(p string) bool {
 	if bestRoot == "" {
 		return false // no readable root covers p
 	}
-	// A namespace directory leading to a nested docset is navigation-only. An
-	// ancestor grant (especially a docset at "/") must not make containers such
-	// as /agent, /user, or /channel visible unless they lead to a nested docset
-	// this identity can actually read; ancestor() handles that case below.
-	for _, boundary := range s.boundaries {
-		if boundary == clean {
-			continue
-		}
-		if clean == "/" || strings.HasPrefix(boundary, clean+"/") {
-			return false
+	// A root grant must not expose namespace containers such as /agent or
+	// /user unless they lead to a granted docset. An explicitly granted non-root
+	// docset, however, must stay navigable even when it contains a private child;
+	// the most-specific-boundary check below still hides that child's subtree.
+	if bestRoot == "/" {
+		for _, boundary := range s.boundaries {
+			if boundary == clean {
+				continue
+			}
+			if clean == "/" || strings.HasPrefix(boundary, clean+"/") {
+				return false
+			}
 		}
 	}
 	bestBoundary := ""
@@ -656,6 +702,13 @@ func (s *scopedReadFS) ReadFile(p string) ([]byte, error) {
 		return nil, fs.ErrNotExist
 	}
 	return s.FileSystem.ReadFile(p)
+}
+
+func (s *scopedReadFS) ReadFileBounded(p string, maxBytes int64) ([]byte, error) {
+	if !s.within(p) {
+		return nil, fs.ErrNotExist
+	}
+	return readFileBounded(s.FileSystem, p, maxBytes)
 }
 
 func (s *scopedReadFS) ReadDir(p string) ([]vfs.FileInfo, error) {

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"fmt"
+	"encoding/json"
 	"sort"
 	"strings"
 
@@ -155,20 +155,56 @@ func newMCPShellHandler(fs vfs.FileSystem, envVars map[string]string, factory fu
 			}
 		}
 
-		var stdout, stderr bytes.Buffer
-		exitCode := sh.ExecPipeline(input.Command, &stdout, &stderr, nil)
-
-		result := stdout.String()
-		if stderr.Len() > 0 {
-			result += "\n" + stderr.String()
-		}
-		if exitCode != 0 {
-			result += fmt.Sprintf("\nexit code: %d", exitCode)
-		}
+		output, stdout, stderr, exitCode := execShellTranscript(sh, input.Command)
 
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: result}},
+			Content:           []mcp.Content{&mcp.TextContent{Text: output}},
+			StructuredContent: map[string]any{"output": output, "stdout": stdout, "stderr": stderr, "exit_code": exitCode},
 		}, nil, nil
+	}
+}
+
+// execShellTranscript executes command in sh and returns its output streams
+// separately, along with a merged output value for backwards compatibility.
+// The exit code remains result data and is never added to either stream.
+func execShellTranscript(sh *shell.Shell, command string) (output, stdout, stderr string, exitCode int) {
+	var stdoutBuffer, stderrBuffer bytes.Buffer
+	exitCode = sh.ExecPipeline(command, &stdoutBuffer, &stderrBuffer, nil)
+
+	sections := make([]string, 0, 2)
+	if stdoutBuffer.Len() > 0 {
+		sections = append(sections, stdoutBuffer.String())
+	}
+	if stderrBuffer.Len() > 0 {
+		sections = append(sections, stderrBuffer.String())
+	}
+	return strings.Join(sections, "\n"), stdoutBuffer.String(), stderrBuffer.String(), exitCode
+}
+
+// exitCodeFromStructured extracts the exit_code field the shell tool places in
+// StructuredContent. The value has been through JSON on the way back to the
+// client, so its concrete Go type depends on the decoder: float64 today,
+// json.Number or an integer type if the SDK changes how it decodes.
+func exitCodeFromStructured(structured any) (int, bool) {
+	m, ok := structured.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	switch v := m["exit_code"].(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(n), true
+	default:
+		return 0, false
 	}
 }
 

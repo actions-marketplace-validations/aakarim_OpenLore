@@ -53,7 +53,8 @@ func CmdSed(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin io
 		for _, f := range files {
 			// Read the raw base bytes so the commit can compare-and-swap
 			// against exactly what we transformed (true CAS under hash policy).
-			orig, rerr := ctx.FS().ReadFile(ctx.Resolve(f))
+			resolved := ctx.Resolve(f)
+			orig, rerr := ctx.FS().ReadFile(resolved)
 			if rerr != nil {
 				fmt.Fprintf(errW, "sed: %s: %s\n", f, rerr)
 				code = 1
@@ -61,7 +62,7 @@ func CmdSed(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin io
 			}
 			lines := splitLinesForSed(orig)
 			var buf bytes.Buffer
-			applySedCommands(cmds, lines, quiet, &buf)
+			applySedCommands(cmds, lines, quiet, &buf, nil)
 			if c := WriteFileCASMsg(ctx, errW, "sed", f, buf.Bytes(), orig); c != 0 {
 				code = c
 			}
@@ -69,13 +70,74 @@ func CmdSed(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin io
 		return code
 	}
 
-	lines, code := ReadInputLines(ctx, files, stdin, errW, "sed")
+	lines, metricFiles, code := readSedInput(ctx, files, stdin, errW)
 	if code != 0 {
 		return code
 	}
 
-	applySedCommands(cmds, lines, quiet, w)
+	var printedLines []int
+	var recordPrint func(int)
+	if quiet && metricsEnabled(ctx) {
+		recordPrint = func(line int) { printedLines = append(printedLines, line) }
+	}
+	applySedCommands(cmds, lines, quiet, w, recordPrint)
+	emitSedReads(ctx, metricFiles, quiet, printedLines)
 	return 0
+}
+
+type sedMetricFile struct {
+	path       string
+	content    []byte
+	lineOffset int
+	lineCount  int
+}
+
+func readSedInput(ctx CmdContext, files []string, stdin io.Reader, errW io.Writer) ([]string, []sedMetricFile, int) {
+	if len(files) == 0 || !metricsEnabled(ctx) {
+		lines, code := ReadInputLines(ctx, files, stdin, errW, "sed")
+		return lines, nil, code
+	}
+	var lines []string
+	var tracked []sedMetricFile
+	for _, file := range files {
+		resolved := ctx.Resolve(file)
+		content, err := ctx.FS().ReadFile(resolved)
+		if err != nil {
+			fmt.Fprintf(errW, "sed: %s: %s\n", file, err)
+			return nil, nil, 1
+		}
+		fileLines := splitLinesForInput(content)
+		tracked = append(tracked, sedMetricFile{path: resolved, content: content, lineOffset: len(lines), lineCount: len(fileLines)})
+		lines = append(lines, fileLines...)
+	}
+	return lines, tracked, 0
+}
+
+func splitLinesForInput(content []byte) []string {
+	text := string(content)
+	if strings.HasSuffix(text, "\n") {
+		text = text[:len(text)-1]
+	}
+	return strings.Split(text, "\n")
+}
+
+func emitSedReads(ctx CmdContext, files []sedMetricFile, quiet bool, printedLines []int) {
+	for _, file := range files {
+		if !quiet {
+			emitDocMetric(ctx, "doc.read", file.path, file.content, fullLineRange(file.content))
+			continue
+		}
+		var selected []int
+		seen := make([]bool, file.lineCount)
+		for _, globalLine := range printedLines {
+			local := globalLine - file.lineOffset - 1
+			if local >= 0 && local < file.lineCount && !seen[local] {
+				selected = append(selected, local+1)
+				seen[local] = true
+			}
+		}
+		emitDocLineMetrics(ctx, "doc.read", file.path, file.content, selected)
+	}
 }
 
 // splitLinesForSed splits raw file bytes into lines using the same convention
@@ -94,7 +156,7 @@ func splitLinesForSed(content []byte) []string {
 
 // applySedCommands runs the parsed sed commands over lines, writing the result
 // to w. It is shared by streaming and in-place (`-i`) modes.
-func applySedCommands(cmds []sedCmd, lines []string, quiet bool, w io.Writer) {
+func applySedCommands(cmds []sedCmd, lines []string, quiet bool, w io.Writer, onPrint func(int)) {
 	totalLines := len(lines)
 	for lineNum, line := range lines {
 		deleted := false
@@ -112,26 +174,31 @@ func applySedCommands(cmds []sedCmd, lines []string, quiet bool, w io.Writer) {
 			case 'p':
 				fmt.Fprintln(w, line)
 				printed = true
+				if onPrint != nil {
+					onPrint(lineNum + 1)
+				}
 			case 's':
 				var re *regexp.Regexp
+				pattern := basicRegexpToRE2(cmd.pattern)
+				replacement := sedReplacementToRE2(cmd.replacement)
 				if cmd.sFlags.caseInsensitive {
-					re, _ = regexp.Compile("(?i)" + cmd.pattern)
+					re, _ = regexp.Compile("(?i)" + pattern)
 				} else {
-					re, _ = regexp.Compile(cmd.pattern)
+					re, _ = regexp.Compile(pattern)
 				}
 				if re != nil {
 					if cmd.sFlags.global {
-						line = re.ReplaceAllString(line, cmd.replacement)
+						line = re.ReplaceAllString(line, replacement)
 					} else {
 						line = re.ReplaceAllStringFunc(line, func(match string) string {
-							result := re.ReplaceAllString(match, cmd.replacement)
+							result := re.ReplaceAllString(match, replacement)
 							return result
 						})
 						count := 0
 						line2 := re.ReplaceAllStringFunc(lines[lineNum], func(match string) string {
 							count++
 							if count == 1 {
-								return re.ReplaceAllString(match, cmd.replacement)
+								return re.ReplaceAllString(match, replacement)
 							}
 							return match
 						})
@@ -214,7 +281,7 @@ func parseSedCommands(expressions []string) []sedCmd {
 				break
 			}
 
-			separator := strings.IndexByte(expr, ';')
+			separator := indexSedCommandSeparator(expr)
 			if separator < 0 {
 				cmds = append(cmds, parseSedExpr(expr))
 				break
@@ -239,16 +306,87 @@ func parseSedCommands(expressions []string) []sedCmd {
 	return cmds
 }
 
+// indexSedCommandSeparator returns the first semicolon separating sed
+// commands. Semicolons within an address, substitution pattern, or
+// substitution replacement belong to that delimited value.
+func indexSedCommandSeparator(expr string) int {
+	i := 0
+	if i < len(expr) && expr[i] == '/' {
+		end := indexUnescapedSedDelimiter(expr, i+1, '/')
+		if end < 0 {
+			return -1
+		}
+		i = end + 1
+	} else if i < len(expr) && expr[i] == '$' {
+		i++
+	} else {
+		for i < len(expr) && expr[i] >= '0' && expr[i] <= '9' {
+			i++
+		}
+	}
+	if i < len(expr) && expr[i] == ',' {
+		i++
+		if i < len(expr) && expr[i] == '/' {
+			end := indexUnescapedSedDelimiter(expr, i+1, '/')
+			if end < 0 {
+				return -1
+			}
+			i = end + 1
+		} else if i < len(expr) && expr[i] == '$' {
+			i++
+		} else {
+			for i < len(expr) && expr[i] >= '0' && expr[i] <= '9' {
+				i++
+			}
+		}
+	}
+
+	if i < len(expr) && expr[i] == 's' && i+1 < len(expr) {
+		delim := expr[i+1]
+		end := indexUnescapedSedDelimiter(expr, i+2, delim)
+		if end < 0 {
+			return -1
+		}
+		end = indexUnescapedSedDelimiter(expr, end+1, delim)
+		if end < 0 {
+			return -1
+		}
+		i = end + 1
+	}
+	if separator := strings.IndexByte(expr[i:], ';'); separator >= 0 {
+		return i + separator
+	}
+	return -1
+}
+
+func indexUnescapedSedDelimiter(expr string, start int, delim byte) int {
+	escaped := false
+	for i := start; i < len(expr); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if expr[i] == '\\' {
+			escaped = true
+			continue
+		}
+		if expr[i] == delim {
+			return i
+		}
+	}
+	return -1
+}
+
 func parseSedExpr(expr string) sedCmd {
 	var cmd sedCmd
 	i := 0
 
 	// Parse address
 	if i < len(expr) && expr[i] == '/' {
-		end := strings.Index(expr[i+1:], "/")
+		end := indexUnescapedSedDelimiter(expr, i+1, '/')
 		if end >= 0 {
-			cmd.addrRegex = expr[i+1 : i+1+end]
-			i = i + 1 + end + 1
+			cmd.addrRegex = strings.ReplaceAll(expr[i+1:end], `\/`, "/")
+			i = end + 1
 		}
 	} else if i < len(expr) && expr[i] == '$' {
 		cmd.addrStart = -1
@@ -269,10 +407,10 @@ func parseSedExpr(expr string) sedCmd {
 			cmd.addrEnd = -1
 			i++
 		} else if i < len(expr) && expr[i] == '/' {
-			end := strings.Index(expr[i+1:], "/")
+			end := indexUnescapedSedDelimiter(expr, i+1, '/')
 			if end >= 0 {
-				cmd.addrEndRegex = expr[i+1 : i+1+end]
-				i = i + 1 + end + 1
+				cmd.addrEndRegex = strings.ReplaceAll(expr[i+1:end], `\/`, "/")
+				i = end + 1
 			}
 		} else {
 			j := i
@@ -291,9 +429,14 @@ func parseSedExpr(expr string) sedCmd {
 	switch expr[i] {
 	case 'a':
 		cmd.command = 'a'
-		cmd.text = strings.TrimPrefix(expr[i+1:], "\\")
-		cmd.text = strings.TrimPrefix(cmd.text, "\r\n")
-		cmd.text = strings.TrimPrefix(cmd.text, "\n")
+		cmd.text = expr[i+1:]
+		if strings.HasPrefix(cmd.text, "\\") {
+			cmd.text = strings.TrimPrefix(cmd.text, "\\")
+			cmd.text = strings.TrimPrefix(cmd.text, "\r\n")
+			cmd.text = strings.TrimPrefix(cmd.text, "\n")
+		} else {
+			cmd.text = strings.TrimLeft(cmd.text, " \t")
+		}
 	case 's':
 		cmd.command = 's'
 		if i+1 < len(expr) {
@@ -349,4 +492,35 @@ func splitSedSubst(s string, delim byte) []string {
 		parts = append(parts, cur.String())
 	}
 	return parts
+}
+
+func sedReplacementToRE2(replacement string) string {
+	var translated strings.Builder
+	for i := 0; i < len(replacement); i++ {
+		switch replacement[i] {
+		case '\\':
+			if i+1 >= len(replacement) {
+				translated.WriteByte('\\')
+				continue
+			}
+			next := replacement[i+1]
+			switch {
+			case next >= '1' && next <= '9':
+				fmt.Fprintf(&translated, "${%c}", next)
+				i++
+			case next == '&' || next == '\\':
+				translated.WriteByte(next)
+				i++
+			default:
+				translated.WriteByte('\\')
+			}
+		case '&':
+			translated.WriteString("${0}")
+		case '$':
+			translated.WriteString("$$")
+		default:
+			translated.WriteByte(replacement[i])
+		}
+	}
+	return translated.String()
 }

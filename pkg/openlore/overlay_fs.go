@@ -24,6 +24,8 @@ type OverlayFS struct {
 	mu    sync.Mutex
 }
 
+func (o *OverlayFS) HostDir(p string) (string, bool) { return o.upper.HostDir(p) }
+
 // NewOverlayFS creates a filesystem with upper as its writable layer and lower
 // as its read-only fallback.
 func NewOverlayFS(upper *DirFS, lower vfs.FileSystem) *OverlayFS {
@@ -60,6 +62,14 @@ func (o *OverlayFS) ReadFile(p string) ([]byte, error) {
 		return b, err
 	}
 	return o.lower.ReadFile(p)
+}
+
+func (o *OverlayFS) ReadFileBounded(p string, maxBytes int64) ([]byte, error) {
+	b, err := readFileBounded(o.upper, p, maxBytes)
+	if err == nil || !errors.Is(err, fs.ErrNotExist) || o.lower == nil {
+		return b, err
+	}
+	return readFileBounded(o.lower, p, maxBytes)
 }
 
 func (o *OverlayFS) ReadDir(p string) ([]vfs.FileInfo, error) {

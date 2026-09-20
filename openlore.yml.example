@@ -32,6 +32,32 @@ port: 2222
 # Prometheus metrics port. Set to 0 to disable.
 metrics_port: 3000
 
+# Usage analytics is enabled by default. Set enabled: false to disable it.
+# analytics:
+#   enabled: true
+#   dir: analytics
+#   log:
+#     rotate: 24h
+#     compress: zstd
+#     retention: 90d
+#   ship:
+#     interval: 30s
+#     remote: none
+#   pipeline:
+#     enabled: true
+#     buffer: 1024
+#   shutdown_timeout: 10s
+#   aggregations:
+#     refresh_interval: 5m
+#     store: sqlite # sqlite | file
+#   index:
+#     workers: 2
+#   history:
+#     blobs: true
+#     retention: 365d
+#   export:
+#     prometheus: true
+
 # ── MCP (Model Context Protocol) ──────────────────────
 #
 # The MCP-over-HTTP endpoint lets MCP-aware clients (Claude Desktop,
@@ -45,7 +71,8 @@ metrics_port: 3000
 mcp:
   enabled: true
   path: /mcp
-  # Force OAuth login even when lore.json allows keyless/anonymous access.
+  # Force OAuth login for MCP-over-HTTP and the JSON API even when lore.json
+  # allows keyless/anonymous access.
   # Omit this setting to inherit the SSH posture from allow_keyless.
   require_auth: true
 
@@ -146,10 +173,12 @@ host_key_path: .ssh/openlore_ed25519
 #
 # Enable bearer-token auth for the MCP + HTTP API. This is SERVER
 # infrastructure — how this instance mints and verifies tokens — so it
-# lives here, not in lore.json (which is access policy). When omitted,
-# the MCP/HTTP endpoints serve anonymous callers (Phase 0). Posture
+# lives here, not in lore.json (which is access policy). Posture
 # (public vs token-required) derives from lore.json's allow_keyless by default;
-# mcp.require_auth can override it for the MCP endpoint.
+# mcp.require_auth can override it for both HTTP transports. When this block
+# is omitted and the posture is public, /mcp and /api serve anonymous callers
+# (Phase 0); when it is omitted but the posture requires a token (allow_keyless:
+# false, or mcp.require_auth: true), those endpoints fail closed with 401.
 #
 # The ES256 signing key is generated on first boot under <data_dir>/auth/.
 # Public keys are published at /.well-known/jwks.json. Passkey login mints
@@ -266,6 +295,16 @@ files:
 # never drift from them. Add an `okf` block to a docset in lore.json to enable
 # it for that docset's subtree; scope narrower subtrees with nested docsets.
 # See lore.json.example for the schema.
+
+# ── Folder Rules ──────────────────────────────────────
+#
+# Rules (size caps, OKF, link checks) are declared per docset in lore.json and
+# per folder in .lore/config.yaml files inside the content tree. See
+# docs/folder-rules.md. The only server-wide setting is the default growth
+# multiplier for `max: initial` size rules (must be >= 1). `rules.tokenizer`
+# is reserved and rejected until a real tokenizer ships.
+# rules:
+#   growth: 1.25
 
 # ── Display ───────────────────────────────────────────
 

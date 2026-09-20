@@ -59,8 +59,11 @@ type shellRequest struct {
 }
 
 type toolResponse struct {
-	Output  string `json:"output"`
-	IsError bool   `json:"is_error"`
+	Output   string `json:"output"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	IsError  bool   `json:"is_error"`
+	ExitCode int    `json:"exit_code"`
 }
 
 func (a *MCPHTTPAPI) handleShell(w http.ResponseWriter, r *http.Request) {
@@ -101,10 +104,21 @@ func (a *MCPHTTPAPI) callTool(w http.ResponseWriter, ctx context.Context, name s
 		return
 	}
 
-	writeJSON(w, http.StatusOK, toolResponse{
-		Output:  contentText(result),
-		IsError: result.IsError,
-	})
+	response := toolResponse{
+		Output:   contentText(result),
+		IsError:  result.IsError,
+		ExitCode: resultExitCode(result),
+	}
+	if structured, ok := result.StructuredContent.(map[string]any); ok {
+		response.Stdout, _ = structured["stdout"].(string)
+		response.Stderr, _ = structured["stderr"].(string)
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func resultExitCode(result *mcp.CallToolResult) int {
+	exitCode, _ := exitCodeFromStructured(result.StructuredContent)
+	return exitCode
 }
 
 // connect establishes a fresh in-process client<->server MCP session bound to

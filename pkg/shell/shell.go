@@ -2,6 +2,7 @@ package shell
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"path"
@@ -10,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/aakarim/go-openlore/internal/analytics"
 	"github.com/aakarim/go-openlore/pkg/openlore/meta"
 	"github.com/aakarim/go-openlore/pkg/openlore/validation"
 	"github.com/aakarim/go-openlore/pkg/shell/cmds"
@@ -26,8 +28,9 @@ type Shell struct {
 	// "unrestricted" — every action is allowed (the default, backward
 	// compatible). When non-nil, a command (or redirect) whose capability
 	// class is absent is treated as if it does not exist.
-	allowedActions   map[cmds.Action]bool
-	actionAuthorizer func(cmds.Action) bool
+	allowedActions      map[cmds.Action]bool
+	actionAuthorizer    func(cmds.Action) bool
+	actionDeniedMessage string
 	// conflictPolicyFn resolves the write-conflict policy for a resolved path.
 	// nil means "use the default" (vfs.PolicyHash). The server sets this to a
 	// per-docset resolver; standalone shells get the default.
@@ -38,6 +41,10 @@ type Shell struct {
 	docsets                 []cmds.DocsetInfo
 	publishTargets          []cmds.PublishTarget
 	unsupportedUsageHandler func(UnsupportedUsage)
+	commandObserver         func(CommandExecution)
+	invocationID            string
+	commandEventID          string
+	pipelinePosition        int
 	// metaExtenders are the plugin-contributed extenders applied by `lore meta`,
 	// installed by the host per session. nil for a standalone shell.
 	metaExtenders []meta.Extender
@@ -51,6 +58,12 @@ type Shell struct {
 	configReload         cmds.ConfigReloadBackend
 	history              cmds.HistoryBackend
 	jobs                 cmds.JobBackend
+	size                 cmds.SizeBackend
+	analytics            *analytics.Service
+	analyticsAuthorizer  func() bool
+	facts                analytics.ContentFacts
+	metricEmitter        func(context.Context, string, map[string]any)
+	invocationObserver   func(string, string)
 	exitRequested        bool
 }
 
@@ -62,6 +75,17 @@ type UnsupportedUsage struct {
 	Command string
 	Syntax  string
 	Error   string
+}
+
+type CommandExecution struct {
+	Command          string
+	Argc             int
+	ExitCode         int
+	Duration         time.Duration
+	BytesOut         int64
+	PipelinePosition int
+	InvocationID     string
+	EventID          string
 }
 
 // NewShell creates a new Shell backed by the given vfs.FileSystem.
@@ -77,6 +101,8 @@ func NewShell(fs vfs.FileSystem) *Shell {
 func (s *Shell) SetUnsupportedUsageHandler(handler func(UnsupportedUsage)) {
 	s.unsupportedUsageHandler = handler
 }
+
+func (s *Shell) SetCommandObserver(observer func(CommandExecution)) { s.commandObserver = observer }
 
 // SetAllowedActions restricts the shell to the given capability classes
 // (Part B). Passing nil (or not calling this) leaves the shell unrestricted.
@@ -104,6 +130,11 @@ func (s *Shell) ActionAllowed(a cmds.Action) bool {
 
 // SetActionAuthorizer installs a per-invocation narrowing check.
 func (s *Shell) SetActionAuthorizer(fn func(cmds.Action) bool) { s.actionAuthorizer = fn }
+
+// SetActionDeniedMessage makes capability denials explicit instead of hiding
+// the denied command. An empty message retains the default "command not found"
+// behavior.
+func (s *Shell) SetActionDeniedMessage(message string) { s.actionDeniedMessage = message }
 
 // SetConflictPolicyFn installs a resolver that maps a resolved path to its
 // write-conflict policy. Passing nil restores the default (vfs.PolicyHash).
@@ -162,6 +193,34 @@ func (s *Shell) SetHistoryBackend(b cmds.HistoryBackend)           { s.history =
 func (s *Shell) HistoryBackend() cmds.HistoryBackend               { return s.history }
 func (s *Shell) SetJobBackend(b cmds.JobBackend)                   { s.jobs = b }
 func (s *Shell) JobBackend() cmds.JobBackend                       { return s.jobs }
+func (s *Shell) SetSizeBackend(b cmds.SizeBackend)                 { s.size = b }
+func (s *Shell) SizeBackend() cmds.SizeBackend                     { return s.size }
+func (s *Shell) SetAnalytics(service *analytics.Service) {
+	s.analytics = service
+	if service != nil && s.facts == nil {
+		s.facts = analytics.NewContentFacts(s.fs)
+	}
+}
+func (s *Shell) Analytics() *analytics.Service { return s.analytics }
+
+// SetAnalyticsAuthorizer installs a live authorization check for instance-wide
+// analytics operations. Without one, those operations are denied.
+func (s *Shell) SetAnalyticsAuthorizer(fn func() bool) { s.analyticsAuthorizer = fn }
+func (s *Shell) AnalyticsAdminAllowed() bool {
+	return s.analyticsAuthorizer != nil && s.analyticsAuthorizer()
+}
+func (s *Shell) SetFacts(facts analytics.ContentFacts) { s.facts = facts }
+func (s *Shell) Facts() analytics.ContentFacts         { return s.facts }
+func (s *Shell) SetMetricEmitter(fn func(context.Context, string, map[string]any)) {
+	s.metricEmitter = fn
+}
+func (s *Shell) EmitMetric(ctx context.Context, eventType string, fields map[string]any) {
+	if s.metricEmitter != nil {
+		s.metricEmitter(analytics.ContextWithInvocation(ctx, s.invocationID, s.commandEventID), eventType, fields)
+	}
+}
+func (s *Shell) MetricsEnabled() bool                          { return s.metricEmitter != nil }
+func (s *Shell) SetInvocationObserver(fn func(string, string)) { s.invocationObserver = fn }
 
 // --- CmdContext interface implementation ---
 
@@ -215,6 +274,8 @@ func (s *Shell) ExecPipeline(line string, w io.Writer, errW io.Writer, stdin io.
 
 func (s *Shell) execLine(line string, w io.Writer, errW io.Writer, stdin io.Reader) int {
 	s.exitRequested = false
+	s.invocationID = analytics.NewID()
+	s.pipelinePosition = 0
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return 0
@@ -325,6 +386,38 @@ func (s *Shell) execCmd(cmd parser.Command, w io.Writer, errW io.Writer, stdin i
 }
 
 func (s *Shell) execCall(call *parser.CallExpr, w io.Writer, errW io.Writer, stdin io.Reader) int {
+	if s.commandObserver == nil || len(call.Args) == 0 {
+		return s.execCallObserved(call, w, errW, stdin)
+	}
+	command := s.expandWord(call.Args[0])
+	eventID := analytics.NewID()
+	s.commandEventID = eventID
+	defer func() { s.commandEventID = "" }()
+	if s.invocationObserver != nil {
+		s.invocationObserver(s.invocationID, eventID)
+		defer s.invocationObserver("", "")
+	}
+	position := s.pipelinePosition
+	s.pipelinePosition++
+	counter := &countingWriter{Writer: w}
+	started := time.Now()
+	code := s.execCallObserved(call, counter, errW, stdin)
+	s.commandObserver(CommandExecution{Command: command, Argc: len(call.Args) - 1, ExitCode: code, Duration: time.Since(started), BytesOut: counter.n, PipelinePosition: position, InvocationID: s.invocationID, EventID: eventID})
+	return code
+}
+
+type countingWriter struct {
+	io.Writer
+	n int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+func (s *Shell) execCallObserved(call *parser.CallExpr, w io.Writer, errW io.Writer, stdin io.Reader) int {
 	// A `> file` / `>> file` redirection buffers the command's stdout and
 	// commits it as a single atomic whole-object write. Nothing is committed
 	// unless the command succeeds (commit-on-success only — no half-files).
@@ -341,6 +434,10 @@ func (s *Shell) execCall(call *parser.CallExpr, w io.Writer, errW io.Writer, std
 		// A file redirect is a write; gate it at parse time (Part B) so a
 		// read-only session cannot use `>`/`>>` to mutate a docset.
 		if !s.ActionAllowed(cmds.ActionWrite) {
+			if s.actionDeniedMessage != "" {
+				fmt.Fprintf(errW, "redirect: %s: %s\n", target, s.actionDeniedMessage)
+				return 1
+			}
 			fmt.Fprintf(errW, "redirect: %s: read-only filesystem\n", target)
 			return 1
 		}
@@ -416,6 +513,10 @@ func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer
 		// not allowed to perform is hidden — it reports "command not found"
 		// so the restricted surface is not even discoverable.
 		if !s.ActionAllowed(cmds.InvocationAction(cmdName, cmdArgs)) {
+			if s.actionDeniedMessage != "" {
+				fmt.Fprintf(errW, "%s: %s\n", cmdName, s.actionDeniedMessage)
+				return 1
+			}
 			fmt.Fprintf(errW, "%s: command not found\n", cmdName)
 			fmt.Fprintln(errW, "Type 'help' for available commands.")
 			return 127

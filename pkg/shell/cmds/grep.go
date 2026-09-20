@@ -18,6 +18,8 @@ func CmdGrep(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 	countOnly := false
 	invertMatch := false
 	filesWithMatches := false
+	extendedRegexp := false
+	fixedStrings := false
 	var pattern string
 	var targets []string
 
@@ -42,6 +44,12 @@ func CmdGrep(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 					invertMatch = true
 				case 'l':
 					filesWithMatches = true
+				case 'E':
+					extendedRegexp = true
+					fixedStrings = false
+				case 'F':
+					fixedStrings = true
+					extendedRegexp = false
 				}
 			}
 		} else if pattern == "" {
@@ -57,6 +65,11 @@ func CmdGrep(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 	}
 
 	rePattern := pattern
+	if fixedStrings {
+		rePattern = regexp.QuoteMeta(pattern)
+	} else if !extendedRegexp {
+		rePattern = basicRegexpToRE2(pattern)
+	}
 	if caseInsensitive {
 		rePattern = "(?i)" + rePattern
 	}
@@ -70,9 +83,13 @@ func CmdGrep(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 	}
 
 	found := false
+	matchedFiles := 0
+	matchedLines := 0
 
-	grepLines := func(lines []string, filePath string, showFile bool) {
+	grepLines := func(lines []string, filePath string, showFile bool) []int {
 		matchCount := 0
+		listedFile := false
+		var lineHits []int
 		for i, line := range lines {
 			matched := re.MatchString(line)
 			if invertMatch {
@@ -83,12 +100,14 @@ func CmdGrep(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 			}
 			found = true
 			matchCount++
+			lineHits = append(lineHits, i+1)
 
 			if filesWithMatches {
-				if filePath != "" {
+				if filePath != "" && !listedFile {
 					fmt.Fprintln(w, filePath)
+					listedFile = true
 				}
-				return
+				continue
 			}
 			if countOnly {
 				continue
@@ -118,13 +137,15 @@ func CmdGrep(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 				fmt.Fprintf(w, "%d\n", matchCount)
 			}
 		}
+		return lineHits
 	}
 
 	// Read from stdin if no targets and stdin is available (pipe)
 	if len(targets) == 0 && stdin != nil {
 		data, _ := io.ReadAll(stdin)
-		lines := strings.Split(string(data), "\n")
-		grepLines(lines, "", false)
+		lines := contentLines(data)
+		lineHits := grepLines(lines, "", false)
+		emitSearchMetric(ctx, pattern, nil, 0, len(lineHits), len(lineHits) > 0)
 		if !found {
 			return 1
 		}
@@ -143,8 +164,14 @@ func CmdGrep(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 		if err != nil {
 			return
 		}
-		lines := strings.Split(string(content), "\n")
-		grepLines(lines, filePath, multiFile)
+		lines := contentLines(content)
+		lineHits := grepLines(lines, filePath, multiFile)
+		if len(lineHits) == 0 {
+			return
+		}
+		matchedFiles++
+		matchedLines += len(lineHits)
+		emitDocLineMetrics(ctx, "doc.hit", filePath, content, lineHits)
 	}
 
 	for _, target := range targets {
@@ -170,9 +197,68 @@ func CmdGrep(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 			grepFile(p)
 		}
 	}
+	emitSearchMetric(ctx, pattern, scopePaths(ctx, targets), matchedFiles, matchedLines, found)
 
 	if !found {
 		return 1
 	}
 	return 0
+}
+
+func basicRegexpToRE2(pattern string) string {
+	var translated strings.Builder
+	inBracket := false
+	bracketCanNegate := false
+	bracketHasChar := false
+
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if ch == '\\' && i+1 < len(pattern) {
+			if !inBracket && strings.ContainsRune("(){}|+?", rune(pattern[i+1])) {
+				i++
+				translated.WriteByte(pattern[i])
+				continue
+			}
+			translated.WriteByte(ch)
+			i++
+			translated.WriteByte(pattern[i])
+			if inBracket {
+				bracketCanNegate = false
+				bracketHasChar = true
+			}
+			continue
+		}
+		if ch == '[' && !inBracket {
+			inBracket = true
+			bracketCanNegate = true
+			bracketHasChar = false
+			translated.WriteByte(ch)
+			continue
+		}
+		if inBracket {
+			translated.WriteByte(ch)
+			if bracketCanNegate && ch == '^' {
+				bracketCanNegate = false
+				continue
+			}
+			bracketCanNegate = false
+			if ch == ']' && bracketHasChar {
+				inBracket = false
+			} else {
+				bracketHasChar = true
+			}
+			continue
+		}
+		caretIsAnchor := ch == '^' && (i == 0 || i >= 2 && pattern[i-2] == '\\' && strings.ContainsRune("(|", rune(pattern[i-1])))
+		dollarIsAnchor := ch == '$' && (i == len(pattern)-1 || i+2 < len(pattern) && pattern[i+1] == '\\' && strings.ContainsRune(")|", rune(pattern[i+2])))
+		if ch == '^' && !caretIsAnchor || ch == '$' && !dollarIsAnchor {
+			translated.WriteByte('\\')
+		}
+		if strings.ContainsRune("(){}|+?", rune(ch)) {
+			translated.WriteByte('\\')
+		}
+		translated.WriteByte(ch)
+	}
+
+	return translated.String()
 }

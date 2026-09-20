@@ -7,6 +7,11 @@ and docset policy (`lore.json`).
 
 Create `openlore.yml` in the project root or pass `--config`:
 
+An explicitly loaded config file takes precedence over an embedded
+`openlore.yml` and replaces it rather than merging with it. If no file is
+loaded, OpenLore uses the embedded config when present, then built-in defaults;
+command-line flags always win.
+
 ```yaml
 version: "1"
 
@@ -40,11 +45,38 @@ files:
     - "node_modules"
     - ".env"
 
+# Folder rules (see docs/folder-rules.md). `growth` is the default multiplier
+# for `max: initial` size rules and must be at least 1. `rules.tokenizer` is
+# reserved and rejected at boot until a real tokenizer ships; size/tokens uses
+# the built-in estimator.
+rules:
+  growth: 1.25
+
 # skills_dir: ./skills
 # auth_file: ./lore.json
 # tls_cert: ./cert.pem
 # tls_key: ./key.pem
 ```
+
+Analytics uses SQLite by default for both aggregation materializations and the
+per-file current-facts cache:
+
+```yaml
+analytics:
+  enabled: true
+  dir: analytics
+  aggregations:
+    store: sqlite # use file for the legacy materialization store (no facts cache)
+  index:
+    workers: 2
+```
+
+`analytics.enabled: false` disables the complete analytics application,
+including the facts index. Index workers warm and reconcile raw filesystem
+facts in the background after startup and writes; requests remain read-through
+and compute exact values when a row is absent or the index is unavailable.
+Rows are considered current when size and modification time match. External
+edits that preserve both values are a known blind spot until a later change.
 
 Debug logging can also be enabled with `openlore --debug`. Unknown-command
 events include only the command name, not its arguments. Parser-failure events
@@ -63,7 +95,8 @@ Unknown SSH keys are controlled in `lore.json`:
 Keyless and unknown allowed callers use `guest`, which can receive only
 read-only grants.
 
-MCP-over-HTTP can inherit this posture or independently require OAuth:
+MCP-over-HTTP and the JSON API can inherit this posture or jointly require
+OAuth. The existing `mcp.require_auth` setting governs both HTTP transports:
 
 ```yaml
 mcp:
@@ -71,6 +104,11 @@ mcp:
   path: /mcp
   require_auth: true
 ```
+
+If the resolved posture requires a token (`allow_keyless: false` inherited, or
+`require_auth: true`) but no `tokens` block is configured, `/mcp` and `/api`
+fail closed with 401 and the server logs a warning at startup. Configure
+`tokens`, or set `require_auth: false` to serve anonymous HTTP callers.
 
 ## Roles, docsets, and identities
 
@@ -84,6 +122,9 @@ mcp:
       "allow": { "capabilities": ["spawn"] }
     }
   },
+  "rules": {
+    "doc-size": { "match": ["**/*.md"], "use": "size/kilobytes", "with": { "max": 60 }, "default": true }
+  },
   "docsets": {
     "public": {
       "paths": ["/docs/public"],
@@ -92,7 +133,11 @@ mcp:
     "backend": {
       "paths": ["/docs/api", { "internal/specs": "/docs/specs" }],
       "aliases": ["/api"],
-      "access": { "allow": { "backend": "rw" } }
+      "access": { "allow": { "backend": "rw" } },
+      "rules": {
+        "format": { "match": ["**/*.md"], "use": "okf" }
+      },
+      "config": { "edit": ["backend"] }
     },
     "backend-home": {
       "paths": ["/home/backend"]
@@ -118,6 +163,22 @@ Docsets grant exact role names:
 
 Multiple roles contribute grants independently. Any matching docset deny wins.
 Capability allows form a union across roles, while any capability deny wins.
+
+Folder rules use three keys, all documented in [Folder rules](folder-rules.md):
+
+- Top-level `rules` declares rules that apply to every docset. Each rule has
+  `match`, optional `exclude`, `use` (a member such as `size/kilobytes` or
+  `okf`), `with` (the member's parameters), `enforce` (default `true`) and
+  `default` (`true` lets a folder's `.lore/config.yaml` replace the rule under
+  the same name).
+- `docsets.<name>.rules` declares rules for that docset's paths, with the same
+  shape. The older `docsets.<name>.okf` block is still accepted and is
+  equivalent to declaring the `okf`, `okf/bundle`, `link/resolves` and
+  `link/alias` rules.
+- `docsets.<name>.config.edit` lists the roles allowed to create, edit or
+  delete `.lore/config.yaml` files under the docset and to run
+  `lore size baseline reset`. The role also needs a write grant on the path. A
+  docset without `config.edit` has no one who can change its folder rules.
 
 ## HTTP inbox credentials
 

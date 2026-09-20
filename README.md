@@ -13,30 +13,25 @@ OpenLore is a minimal, extensible, agent-native knowledge base that keeps shared
 
 ## About
 
-AI coding agents already know how to explore files with `ls`, `cat`, `grep`,
-`find`, pipes, and shell loops. OpenLore gives them that same interface over
-SSH, backed by your documentation instead of a real machine.
+AI agents can already read Markdown. The problem starts when multiple agents, repositories or people need to rely on the same knowledge.
 
-```text
-Agent ──SSH or MCP──▶ OpenLore ──▶ docs, knowledge, and artifacts
-```
+Keeping docs inside each repo works until that knowledge gets copied, duplicated or goes stale. Different agents end up working from different versions of the truth, and there is no consistent way to control who can read, update or publish what.
 
-It starts as a single-binary, zero-config, read-only documentation server. When
-you need a live knowledge base, you can add identity-scoped access, controlled
-publishing, atomic writes, validation, and human approval without changing how
-agents read or navigate the content.
+OpenLore gives your agents one shared place for documentation, runbooks, skills and project knowledge. Connect every agent to the same source, update it once, and make the latest version immediately available wherever it is needed.
 
-### Store and retrieve Markdown
+Your knowledge stays as ordinary Markdown. OpenLore serves it as an agent-native virtual filesystem with identity-scoped access, controlled writes, validation and human approval when you need them. There is no ingestion pipeline, vector database or LLM required.
 
-Put documentation, runbooks, project context, or agent-authored notes in
-ordinary Markdown files. There is no ingestion pipeline: point OpenLore at a
-directory and it serves the existing hierarchy directly. Organize documents
-with folders, connect them with standard Markdown links, and group them into
-docsets when different people or agents need different access. OpenLore is
-read-only by default; enable writing when you want agents to create and update
-Markdown too.
+Agents can access the same knowledge through MCP or use familiar commands such as `ls`, `cat`, `grep` and `find` over SSH.
 
-[![OpenLore Skills import demo](assets/demo/v0.4.0/openlore-skills-import.gif)](assets/demo/v0.4.0/openlore-skills-import.mp4)
+SSH is simply one interface. The important part is that every agent is working from the same current, inspectable and governed knowledge.
+
+### Why not just keep Markdown in your repo?
+
+For one agent working in one repository, that's fine.
+
+OpenLore becomes useful when knowledge needs to be shared across agents, repositories or teams, or when you need permissions, publishing, review and a single source of truth without copying the same files everywhere.
+
+[![OpenLore Skills import demo](https://raw.githubusercontent.com/aakarim/openlore-videos/main/assets/demo/v0.4.0/openlore-skills-import.gif)](https://raw.githubusercontent.com/aakarim/openlore-videos/main/assets/demo/v0.4.0/openlore-skills-import.mp4)
 
 ## Quick Start
 
@@ -74,7 +69,8 @@ See [Installation](#installation) for more ways to install and package OpenLore.
 - **Agent-native retrieval** — Agents use the shell tools and composition
   patterns they already understand instead of learning a bespoke retrieval API.
 - **One knowledge surface, multiple transports** — Serve the same virtual
-  filesystem over SSH, SFTP/SSHFS, MCP, and a human-friendly web view.
+  filesystem over SSH, SFTP/SSHFS (including direct VS Code browsing and
+  editing), MCP, and a human-friendly web view.
 - **Live, governed knowledge** — Keep content read-only, allow scoped publishing,
   or enable full writes per docset. Writes are atomic, conflict-aware, and can
   require human approval.
@@ -111,7 +107,7 @@ See [Installation](#installation) for more ways to install and package OpenLore.
 - **Governed knowledge contribution** — Let contributors publish into inboxes
   while reserving sensitive paths for approvers and preventing accidental
   overwrites.
-- **Remote review of agent artifacts** — Expose reports, logs, screenshots, and
+- **Artifact repository** — Store and expose reports, logs, screenshots, and
   generated files through the browser or SSH without building a custom artifact
   viewer or granting access to the agent's machine.
 - **Identity-specific workspaces** — Mount a private home for each agent plus
@@ -184,6 +180,9 @@ cd go-openlore
 go build -o openlore ./cmd/openlore
 ```
 
+This normal Go build is backend-only and does not require Node. Release binaries
+and containers include the dashboard; see [Dashboard build and distribution](docs/dashboard-build.md).
+
 ### Embed docs in a binary
 
 Place documentation in `assets/lore/` and build. The resulting binary contains
@@ -205,8 +204,8 @@ Produce cross-platform binaries with your docs embedded:
     config: ./openlore.yml
 ```
 
-See [Ways to use OpenLore](docs/usage.md) for MCP stdio, MCPB desktop
-packaging, SSHFS, and Go library usage.
+See [Ways to use OpenLore](docs/usage.md) for direct VS Code editing, MCP stdio,
+MCPB desktop packaging, SSHFS, and Go library usage.
 
 ### Create a customized deployment
 
@@ -265,34 +264,20 @@ or SNI routing, so one listener cannot route multiple domains on port 22.
 The container workflow publishes `latest` from `main`; releases also publish
 `VERSION`, `vVERSION`, major, and minor image tags.
 
-### HTTP inbox uploads
-
-Configure a docset `inbox` and a role with its `publish` grant, then create a
-credential for an existing identity (the server configuration must name
-`auth_file` so the CLI can validate it):
-
-```bash
-openlore inbox token create --identity alice --label webhook --config openlore.yml
-curl -H 'Authorization: Bearer olin_ID_SECRET' -H 'Content-Type: text/markdown' \
-  --data-binary @note.md 'https://docs.example.com/inbox/docs?name=note.md'
-```
-
-`POST /inbox/{docset}` accepts bearer credentials or an exact-body HMAC using
-`X-OpenLore-Token-Id` and `X-OpenLore-Signature`. OAuth access tokens are used
-only for `POST/GET /inbox/tokens` and `DELETE /inbox/tokens/{id}`; inbox
-credentials are separate and revocable. See
-[Configuration and identity](docs/configuration-and-identity.md#http-inbox-credentials).
-
 ## Documentation
 
 | Guide | Contents |
 |---|---|
 | [Ways to use OpenLore](docs/usage.md) | SSH, MCP, web, SSHFS, embedded binaries, GitHub Action, MCPB, and library usage |
+| [Editing OpenLore files](docs/editors.md) | Direct VS Code and SFTP editor setup without a local project mirror |
 | [Command reference](docs/commands.md) | Complete shell, introspection, publishing, syntax, CLI command, and flag reference |
 | [Configuration and identity](docs/configuration-and-identity.md) | `openlore.yml`, authentication, roles, docsets, aliases, homes, and host verification |
+| [HTTP inbox uploads](docs/inbox.md) | Upload documents with bearer or HMAC credentials |
 | [Workload identity federation](docs/workload-identity-federation.md) | Authenticate CI and agents with short-lived external identity tokens |
 | [Writing and publishing](docs/writing.md) | Write modes, inboxes, conflict handling, approvals, and jobs |
 | [Plugins and knowledge formats](docs/plugins.md) | Plugin installation, interfaces, OKF validation, `lore validate`, and `lore meta` |
+| [Folder rules](docs/folder-rules.md) | `.lore/config.yaml` and `lore.json` rules, layering, permissions, rejection messages, and growth limits |
+| [Rules standard library](docs/rules-stdlib.md) | Generated reference for compiled-in rule members and their parameters |
 | [Write system internals](docs/write-system.md) | Filesystem layering, write seam, changesets, hooks, and async jobs |
 | [Security evaluation](SECURITY.md) | Threat model and security properties |
 
@@ -309,7 +294,7 @@ See [SECURITY.md](SECURITY.md) for the full security evaluation.
 
 ## License
 
-[MIT](LICENSE) — Adil Karim
+[Apache License 2.0](LICENSE) — Copyright © 2026 Adil Karim
 
 OpenLore bundles third-party open-source components. Their licenses and required
 notices are listed in

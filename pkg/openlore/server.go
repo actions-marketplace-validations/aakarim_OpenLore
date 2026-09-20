@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aakarim/go-openlore/assets"
+	"github.com/aakarim/go-openlore/internal/analytics"
 	"github.com/aakarim/go-openlore/internal/config"
 	"github.com/aakarim/go-openlore/internal/httpserver"
 	"github.com/aakarim/go-openlore/internal/legal"
@@ -28,6 +31,7 @@ import (
 	"github.com/aakarim/go-openlore/internal/webstyle"
 	"github.com/aakarim/go-openlore/pkg/openlore/meta"
 	"github.com/aakarim/go-openlore/pkg/openlore/validation"
+	"github.com/aakarim/go-openlore/pkg/rules"
 	"github.com/aakarim/go-openlore/pkg/shell"
 	"github.com/aakarim/go-openlore/pkg/shell/cmds"
 	"github.com/aakarim/go-openlore/pkg/vfs"
@@ -58,23 +62,32 @@ type Server struct {
 	authEnforced bool
 	// grants is the registry of grant types (ro/rw + plugin-contributed like
 	// publish). A grant name in lore.json with no registered type fails startup.
-	grants   *grantRegistry
-	fs       vfs.FileSystem
-	merge    *MergeFS
-	metrics  *metrics.Metrics
-	srv      *ssh.Server
-	httpSrv  *httpserver.Server
-	passkeys *passkeys.Passkeys
-	logger   *slog.Logger
-	motd     string
+	grants             *grantRegistry
+	fs                 vfs.FileSystem
+	merge              *MergeFS
+	metrics            *metrics.Metrics
+	metricsSrv         *http.Server
+	analytics          *analytics.Service
+	analyticsCancel    context.CancelFunc
+	analyticsPluginsMu sync.Mutex
+	analyticsPlugins   map[string]struct{}
+	historyPath        string
+	historyPosition    func() HistoryPosition
+	historyCancel      context.CancelFunc
+	historyDone        chan struct{}
+	srv                *ssh.Server
+	httpSrv            *httpserver.Server
+	passkeys           *passkeys.Passkeys
+	logger             *slog.Logger
+	motd               string
 
 	onConnect    OnConnectFunc
 	onDisconnect OnDisconnectFunc
 	sessionFSFn  SessionFSFn
 
 	// jobs runs async external work (Part D), surfaced read-only at /jobs.
-	jobs        *JobManager
-	historyPath string
+	jobs    *JobManager
+	history HistoryStore
 
 	// writeLog is the single ordered write log + serialized applier: the sole
 	// writer to the substrate. Non-nil only when the substrate is writable
@@ -93,6 +106,7 @@ type Server struct {
 	readMW            []ReadMiddleware
 	contentTransforms []ContentTransform
 	agentSkills       *agentSkillsPlugin
+	rules             *rulesPlugin
 
 	// metaExtenders are the `lore meta` extenders contributed by plugins,
 	// installed per session in buildSessionShell.
@@ -256,10 +270,18 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 			return nil, err
 		}
 	}
+	rulesPlugin, err := newRulesPluginWithTokenizer(s.auth, rules.Defaults{Growth: cfg.Rules.Growth}, s.merge, logger, cfg.Rules.Tokenizer)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.registerPlugin(rulesPlugin); err != nil {
+		return nil, err
+	}
+	s.rules = rulesPlugin
+	// OKF metadata remains owned by the existing adapter; admission and
+	// validation are provided exclusively by the rules engine above.
 	if anyDocsetHasOKF(s.auth.Docsets) {
-		if err := s.registerPlugin(newOKF(s.auth.Docsets, logger)); err != nil {
-			return nil, err
-		}
+		s.metaExtenders = append(s.metaExtenders, newOKF(s.auth.Docsets, logger).MetaExtenders()...)
 	}
 	if shellPlugin != nil {
 		if err := s.registerPlugin(shellPlugin); err != nil {
@@ -290,6 +312,21 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 		s.merge.SetRoot(lowerFS)
 	}
 
+	if cfg.Analytics.IsEnabled() {
+		analyticsCfg := cfg.Analytics
+		if !filepath.IsAbs(analyticsCfg.Dir) {
+			analyticsCfg.Dir = filepath.Join(dataDir, analyticsCfg.Dir)
+		}
+		service, analyticsErr := analytics.New(analyticsCfg, analytics.Deps{FS: s.merge})
+		if analyticsErr != nil {
+			return nil, fmt.Errorf("configuring analytics: %w", analyticsErr)
+		}
+		s.analytics = service
+		if err := s.registerPlugin(&analyticsPlugin{service: service, server: s}); err != nil {
+			return nil, err
+		}
+	}
+
 	// Enable the experimental writable substrate when the global lock is open.
 	// Fail fast if writes were requested but no backend can support them.
 	if !cfg.Readonly {
@@ -302,15 +339,68 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 		// substrate. Every session routes its mutations here (via middlewareFS),
 		// so it is the sole writer and gives globally ordered writes/removes. The
 		// applier runs the post-commit chain after each durable commit.
+		history := NewJSONLHistoryStore(filepath.Join(dataDir, "history"))
+		migrated, err := history.migrateLegacy()
+		if err != nil {
+			return nil, fmt.Errorf("migrating legacy history: %w", err)
+		}
+		if migrated {
+			logger.Info("legacy history migrated")
+		}
 		s.writeLog = newWriteLog(s.merge, s.postCommitChain(), logger, 0)
-		s.historyPath = filepath.Join(dataDir, "history", "commits.jsonl")
-		s.writeLog.SetCommitRecorder(NewJSONLCommitRecorder(s.historyPath))
+		blobs, blobErr := OpenBlobStore(filepath.Join(dataDir, "history", "objects"))
+		if blobErr != nil {
+			return nil, fmt.Errorf("opening history blob store: %w", blobErr)
+		}
+		commitPath := filepath.Join(dataDir, "history", "commits.jsonl")
+		s.writeLog.SetCommitJournal(commitPath, blobs, cfg.Analytics.HistoryBlobsEnabled())
+		s.historyPath = commitPath
+		if s.analytics != nil {
+			cursor, cursorErr := OpenHistoryCursor(commitPath, HistoryPosition{})
+			if cursorErr != nil {
+				return nil, fmt.Errorf("opening analytics history cursor: %w", cursorErr)
+			}
+			processor := NewScalarProcessor(cursor, blobs, IdentityStoreClassifier(s.identityStore)).(*ScalarProcessor)
+			processor.docset = (&analyticsPlugin{server: s}).docsetForPath
+			processor.SetScalarComputer(s.analytics.ComputeScalars)
+			s.analytics.AddProcessor(processor)
+			s.historyPosition = cursor.Position
+			s.analytics.SetHistoryHealth(func(ctx context.Context) (string, int64, int64, int64) {
+				position := cursor.Position()
+				lag, _ := HistoryCursorLagBytes(commitPath, position)
+				stats, _ := blobs.Stats(ctx)
+				return fmt.Sprintf("%s:%d", position.Segment, position.Offset), lag, stats.Objects, stats.Bytes
+			})
+		}
+		s.history = history
+		s.writeLog.SetHistoryRecorder(s.history)
+		s.writeLog.SetCommitState(rulesPlugin.CommitState)
+		s.writeLog.SetPreApply(func(identity *Identity, attribution Attribution, changes vfs.ChangeSet) error {
+			for _, change := range changes.Leaves() {
+				if identity != nil {
+					if !s.identityCanWrite(*identity, change.Action, change.Target) {
+						return mutationDeniedError(s.merge, change.Action, change.Target)
+					}
+				} else if isDirConfigPath(change.Target) || (change.Action == vfs.ChangeActionRemoveAll && treeContainsDirConfig(s.merge, change.Target)) {
+					// Approved/deferred submissions preserve attribution but not the
+					// original authorization context. Fail closed if current state
+					// requires config.edit; the caller must resubmit normally.
+					return os.ErrPermission
+				}
+			}
+			if err := rulesPlugin.PreApply(attribution, changes); err != nil {
+				return err
+			}
+			if agentSkills != nil {
+				return agentSkills.validateMutation(attribution, changes)
+			}
+			return nil
+		})
 		if agentSkills != nil {
 			agentSkills.submit = func(ctx context.Context, cs vfs.ChangeSet) error {
 				_, err := s.CommitChangeSet(ctx, Attribution{Principal: "agent_skills_remote", internal: true}, cs)
 				return err
 			}
-			s.writeLog.SetPreApply(agentSkills.validateMutation)
 		}
 
 		// Async external work (Part D): the `spawn` command runs a command in a
@@ -383,6 +473,18 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 		s.passkeys = pk
 
 		pk.SetAuthConfig(s.auth)
+		if s.analytics != nil {
+			pk.SetLoginObserver(func(ctx context.Context, name, sessionID string) {
+				id, ok := s.identityForName(name)
+				if !ok {
+					return
+				}
+				id.Transport = "web"
+				id.SessionID = sessionID
+				s.analytics.Record(ctx, s.analyticsEvent(id, "auth.login", map[string]any{"method": "passkey"}))
+				s.analytics.Record(ctx, s.analyticsEvent(id, "session.start", nil))
+			})
+		}
 	}
 
 	if err := s.initAuth(); err != nil {
@@ -521,6 +623,9 @@ func withConn(conn, resolved Identity) Identity {
 	resolved.RemoteAddr = conn.RemoteAddr
 	resolved.User = conn.User
 	resolved.PublicKey = conn.PublicKey
+	resolved.SessionID = conn.SessionID
+	resolved.ClientSessionID = conn.SessionID
+	resolved.Transport = "ssh"
 	resolved.Principal.Source = "ssh"
 	resolved.Principal.Subject = resolved.IdentityName
 	resolved.Principal.Claims = map[string]any{"user": conn.User, "remote_addr": conn.RemoteAddr}
@@ -601,6 +706,7 @@ func (s *Server) sftpSubsystem(sess ssh.Session) {
 	// outside their grants over SFTP.
 	id := s.resolveIdentity(sess)
 	handler := NewSFTPHandler(s.buildSessionFS(id))
+	handler.writesDisabled = s.config.Readonly
 	server := sftp.NewRequestServer(sess, sftp.Handlers{
 		FileGet:  handler,
 		FilePut:  handler,
@@ -630,6 +736,10 @@ func (s *Server) shellHandler(next ssh.Handler) ssh.Handler {
 
 		s.metrics.ActiveSessions.Add(1)
 		s.metrics.TotalSessions.Add(1)
+		if s.analytics != nil {
+			s.analytics.Record(sess.Context(), s.analyticsEvent(id, "auth.login", map[string]any{"method": "ssh-key"}))
+			s.analytics.Record(sess.Context(), s.analyticsEvent(id, "session.start", nil))
+		}
 
 		if s.onConnect != nil {
 			s.onConnect(id)
@@ -637,6 +747,9 @@ func (s *Server) shellHandler(next ssh.Handler) ssh.Handler {
 
 		defer func() {
 			s.metrics.ActiveSessions.Add(-1)
+			if s.analytics != nil {
+				s.analytics.Record(context.Background(), s.analyticsEvent(id, "session.end", map[string]any{"duration_ms": time.Since(id.ConnectedAt).Milliseconds()}))
+			}
 			s.logger.Info("session ended",
 				"remote_addr", id.RemoteAddr,
 				"user", id.User,
@@ -657,7 +770,6 @@ func (s *Server) shellHandler(next ssh.Handler) ssh.Handler {
 		// first and cannot faithfully reconstruct shell operators such as output
 		// redirection, especially when an operator is adjacent to another word.
 		if cmdLine := sess.RawCommand(); cmdLine != "" {
-			s.metrics.TotalCommands.Add(1)
 			exitCode := sh.ExecPipeline(cmdLine, sess, sess.Stderr(), sess)
 			sess.Exit(exitCode)
 			return
@@ -749,10 +861,10 @@ func (s *Server) AdmitChangeSet(ctx context.Context, id Identity, cs vfs.ChangeS
 	}
 	for _, change := range cs.Leaves() {
 		if !s.identityCanWrite(id, change.Action, change.Target) {
-			return WriteResult{}, vfs.ErrReadOnly
+			return WriteResult{}, mutationDeniedError(s.merge, change.Action, change.Target)
 		}
 	}
-	return s.writeChain()(ctx, NewWriteOp(id.attribution(), cs))
+	return s.writeChain()(ctx, newIdentityWriteOp(id, cs))
 }
 
 type HTTPRouteProvider interface {
@@ -806,6 +918,9 @@ func (s *Server) registerPlugin(p any) error {
 			}
 		}
 	}
+	if err := s.registerAnalyticsPlugin(p); err != nil {
+		return err
+	}
 	if wp, ok := p.(WriteMiddlewareProvider); ok {
 		s.writeMW = append(s.writeMW, wp.WriteMiddleware()...)
 	}
@@ -853,7 +968,13 @@ func (s *Server) registerPlugin(p any) error {
 // chain is just the terminal submit.
 func (s *Server) writeChain() WriteHandler {
 	terminal := func(ctx context.Context, op WriteOp) (WriteResult, error) {
-		h, err := s.writeLog.Submit(ctx, op.Attribution, op.persistenceChangeSet())
+		var h string
+		var err error
+		if op.identity != nil {
+			h, err = s.writeLog.SubmitIdentity(ctx, *op.identity, op.persistenceChangeSet())
+		} else {
+			h, err = s.writeLog.Submit(ctx, op.Attribution, op.persistenceChangeSet())
+		}
 		return WriteResult{Hash: h}, err
 	}
 	return chainWrite(terminal, s.writeMW...)
@@ -925,7 +1046,7 @@ func (s *Server) buildCanonicalSessionFS(id Identity) vfs.FileSystem {
 	// Innermost writable wrapper, so the outer layers (scope) can deny or defer
 	// a mutation before it ever becomes a log entry.
 	if s.writeLog != nil {
-		sessionFS = newMiddlewareFS(sessionFS, id.attribution(), s.writeChain())
+		sessionFS = newIdentityMiddlewareFS(sessionFS, id, s.writeChain())
 	}
 	// A write-capable session must be a named non-guest identity with full token
 	// scope. The per-operation authorizer below resolves current roles and grants;
@@ -1013,6 +1134,15 @@ func (s *Server) buildSessionShell(id Identity) *shell.Shell {
 			id.HomeDocset, id.HomeDir = "", ""
 		}
 	}
+	attribution := cloneAttribution(id.attribution())
+	if attribution.Extra == nil {
+		attribution.Extra = map[string]string{}
+	}
+	attribution.Extra["transport"] = id.Transport
+	attribution.Extra["session_id"] = id.SessionID
+	attribution.Extra["client_session_id"] = id.ClientSessionID
+	attribution.Extra["remote_addr"] = id.RemoteAddr
+	id.Attribution = attribution
 	sessionFS := s.buildSessionFS(id)
 	// Command visibility is snapshotted, but privileged operations are narrowed
 	// again at invocation. Guest, read-scoped, and currently read-only sessions
@@ -1021,7 +1151,11 @@ func (s *Server) buildSessionShell(id Identity) *shell.Shell {
 	canAdmin := s.authEnforced && id.policySnapshot != nil && scopeGrantsWrite(id.Scopes) && s.hasCapabilityForPolicy(*id.policySnapshot, "lore:config:edit")
 
 	sh := shell.NewShell(sessionFS)
-	if s.config.Debug {
+	sh.SetInvocationObserver(func(invocationID, parentID string) {
+		attribution.Extra["invocation_id"] = invocationID
+		attribution.Extra["parent_id"] = parentID
+	})
+	if s.config.Debug || s.analytics != nil {
 		sh.SetUnsupportedUsageHandler(func(usage shell.UnsupportedUsage) {
 			attrs := []any{"kind", usage.Kind}
 			if usage.Command != "" {
@@ -1033,9 +1167,51 @@ func (s *Server) buildSessionShell(id Identity) *shell.Shell {
 			if id.IdentityName != "" {
 				attrs = append(attrs, "identity", id.IdentityName)
 			}
-			s.logger.Debug("unsupported shell usage", attrs...)
+			if s.config.Debug {
+				s.logger.Debug("unsupported shell usage", attrs...)
+			}
+			if s.analytics != nil {
+				eventType := "command.unknown"
+				fields := map[string]any{"command": usage.Command}
+				if usage.Kind == "unknown_syntax" {
+					eventType = "syntax.unknown"
+					fields = map[string]any{"syntax": usage.Syntax}
+				}
+				s.analytics.Record(context.Background(), s.analyticsEvent(id, eventType, fields))
+			}
 		})
 	}
+	if s.analytics != nil && s.authEnforced && id.IdentityName != "" && id.IdentityName != "guest" {
+		sh.SetAnalytics(s.analytics)
+		sh.SetAnalyticsAuthorizer(func() bool {
+			return scopeGrantsWrite(id.Scopes) && s.hasCurrentCapability(id, "lore:analytics:admin")
+		})
+	}
+	if s.analytics != nil {
+		sh.SetFacts(s.analytics.NewContentFacts(sessionFS))
+		sh.SetMetricEmitter(func(ctx context.Context, eventType string, fields map[string]any) {
+			if target, ok := fields["path"].(string); ok {
+				fields["docset"] = (&analyticsPlugin{server: s}).docsetForPath(target)
+			}
+			e := s.analyticsEvent(id, eventType, fields)
+			if invocationID, parentID, ok := analytics.InvocationFromContext(ctx); ok {
+				e.InvocationID, e.ParentID = invocationID, parentID
+			}
+			s.analytics.Record(ctx, e)
+		})
+	}
+	sh.SetCommandObserver(func(ce shell.CommandExecution) {
+		if s.metrics != nil {
+			s.metrics.TotalCommands.Add(1)
+		}
+		if s.analytics == nil {
+			return
+		}
+		e := s.analyticsEvent(id, "command.exec", map[string]any{"command": ce.Command, "argc": ce.Argc, "exit_code": ce.ExitCode, "duration_ms": ce.Duration.Milliseconds(), "bytes_out": ce.BytesOut, "pipeline_position": ce.PipelinePosition})
+		e.ID = ce.EventID
+		e.InvocationID = ce.InvocationID
+		s.analytics.Record(context.Background(), e)
+	})
 	if s.config.DefaultCwd != "" {
 		sh.SetCwd(s.config.DefaultCwd)
 	}
@@ -1068,6 +1244,9 @@ func (s *Server) buildSessionShell(id Identity) *shell.Shell {
 		} else {
 			sh.SetAllowedActions(nil) // read-only (ActionRead implied)
 		}
+		if id.IdentityName == "guest" {
+			sh.SetActionDeniedMessage("current user is a guest; guests cannot write")
+		}
 		sh.SetActionAuthorizer(func(action cmds.Action) bool {
 			if action == cmds.ActionWrite && !canWrite {
 				return s.hasCurrentCapability(id, "lore:config:edit")
@@ -1096,10 +1275,28 @@ func (s *Server) buildSessionShell(id Identity) *shell.Shell {
 	if canAdmin {
 		sh.SetConfigReloadBackend(s)
 	}
-	if s.historyPath != "" {
-		sh.SetHistoryBackend(fileHistory{path: s.historyPath, roots: historyRoots(s.sessionDocsets(id))})
+	if s.history != nil {
+		history := scopedHistory{store: s.history, roots: historyRoots(s.sessionDocsets(id))}
+		if canAdmin && s.writeLog != nil {
+			historyDir := filepath.Join(s.config.DataDir, "history")
+			if s.config.DataDir == "" {
+				historyDir = filepath.Join(".openlore", "history")
+			}
+			history.gcTimeout = s.config.Analytics.ShutdownTimeout
+			history.gc = func(ctx context.Context) (HistoryGCStats, error) {
+				var stats HistoryGCStats
+				err := s.writeLog.Do(ctx, func() error {
+					var err error
+					stats, err = GarbageCollectHistoryBlobs(ctx, historyDir)
+					return err
+				})
+				return stats, err
+			}
+		}
+		sh.SetHistoryBackend(history)
 	}
 	sh.SetJobBackend(s.jobs)
+	sh.SetSizeBackend(sessionSizeBackend{server: s, identity: id})
 
 	// Set identity info as environment variables
 	if id.IdentityName != "" {
@@ -1358,6 +1555,11 @@ func (s *Server) ListenAndServe() error {
 	if err := s.validateGrants(); err != nil {
 		return err
 	}
+	if s.analytics != nil {
+		var ctx context.Context
+		ctx, s.analyticsCancel = context.WithCancel(context.Background())
+		s.analytics.Start(ctx)
+	}
 	preparedRoutes := make([]HTTPRouteRegistrar, 0, len(s.httpRoutes))
 	if s.config.HTTPPort > 0 {
 		for _, provider := range s.httpRoutes {
@@ -1367,6 +1569,7 @@ func (s *Server) ListenAndServe() error {
 			}
 			preparedRoutes = append(preparedRoutes, register)
 		}
+		preparedRoutes = append(preparedRoutes, s.dashboardRoutes(assets.Dashboard()))
 	}
 	opts := []ssh.Option{
 		wish.WithAddress(fmt.Sprintf(":%d", s.config.Port)),
@@ -1468,12 +1671,16 @@ func (s *Server) ListenAndServe() error {
 	s.srv = srv
 
 	if s.config.MetricsPort > 0 {
-		metrics.StartServer(s.config.MetricsPort, s.metrics, s.logger)
+		if s.analytics != nil && s.config.Analytics.Export.Prometheus {
+			s.metricsSrv = metrics.StartHandlerServer(s.config.MetricsPort, s.metricsExportHandler(), s.logger)
+		} else {
+			s.metricsSrv = metrics.StartServer(s.config.MetricsPort, s.metrics, s.logger)
+		}
 	}
 
 	if s.config.HTTPPort > 0 {
-		webFS := assets.Web()
-		if webFS != nil {
+		siteFS := assets.Site()
+		if siteFS != nil {
 			httpCfg := httpserver.Config{
 				Port:           s.config.HTTPPort,
 				TLSCert:        s.config.TLSCert,
@@ -1494,15 +1701,12 @@ func (s *Server) ListenAndServe() error {
 				httpCfg.ExtraHandlers["/legal/"] = legalHandler
 				s.logger.Info("legal notices mounted", "path", "/legal", "http_port", s.config.HTTPPort)
 			}
-			httpCfg.ExtraHandlers["/assets/openlore.css"] = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodGet {
-					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-					return
-				}
-				w.Header().Set("Content-Type", "text/css; charset=utf-8")
-				w.Header().Set("Cache-Control", "public, max-age=3600")
-				_, _ = w.Write(webstyle.CSS)
-			})
+			appCSS := staticAppAsset("text/css; charset=utf-8", webstyle.CSS)
+			httpCfg.ExtraHandlers["/assets/openlore/app.css"] = appCSS
+			// Compatibility for existing login and permissions links.
+			httpCfg.ExtraHandlers["/assets/openlore.css"] = appCSS
+			httpCfg.ExtraHandlers["/assets/openlore/outfit.woff2"] = staticAppAsset("font/woff2", webstyle.Outfit)
+			httpCfg.ExtraHandlers["/.well-known/openlore"] = http.HandlerFunc(s.openLoreMetadata)
 
 			// A single MCP server backs both the Streamable HTTP endpoint and
 			// the plain JSON HTTP API below. Its `shell` tool builds a
@@ -1517,6 +1721,17 @@ func (s *Server) ListenAndServe() error {
 				)
 			}
 
+			// Both bearer-token transports share one posture. If it requires a
+			// token but no issuer exists, authMiddleware fails closed (401 on
+			// every request); say so once at boot so the operator can either
+			// configure tokens or opt into anonymous access explicitly.
+			httpAuthRequired := s.config.HTTPAuthRequired()
+			if httpAuthRequired && s.issuer == nil && (s.config.MCPEnabled || s.config.APIEnabled) {
+				s.logger.Warn("HTTP auth posture requires a token but no token issuer is configured; /mcp and /api will reject every request with 401",
+					"allow_keyless", s.config.AllowKeyless,
+					"hint", "set tokens in openlore.yml, or set mcp.require_auth: false to allow anonymous access")
+			}
+
 			// Mount the MCP-over-HTTP (Streamable HTTP) endpoint on the HTTP
 			// server at the configured path, so it reuses the same port/TLS as
 			// the front page (and any load balancer rule fronting it).
@@ -1528,7 +1743,7 @@ func (s *Server) ListenAndServe() error {
 				// Posture-aware bearer auth (§4): identity from a verified token
 				// (or anonymous) is placed on the request context, which the
 				// Streamable transport carries into the tool handler.
-				h := s.authMiddleware(mcpHandler, s.config.MCPAuthRequired())
+				h := s.authMiddleware(s.transportMiddleware(mcpHandler, "mcp"), httpAuthRequired)
 				httpCfg.ExtraHandlers[mcpPath] = h
 				httpCfg.ExtraHandlers[mcpPath+"/"] = h
 				s.logger.Info("MCP endpoint mounted", "path", mcpPath, "http_port", s.config.HTTPPort)
@@ -1540,7 +1755,21 @@ func (s *Server) ListenAndServe() error {
 			if s.config.APIEnabled && s.config.APIPath != "" {
 				apiPath := "/" + strings.Trim(s.config.APIPath, "/")
 				api := NewMCPHTTPAPI(mcpServer, s.shellForContext)
-				httpCfg.ExtraHandlers[apiPath+"/"] = s.authMiddleware(api.Handler(apiPath), !s.config.AllowKeyless)
+				if s.analytics != nil {
+					api.sessions.onStart = func(ctx context.Context, sessionID string) {
+						id := s.identityFromContext(ctx)
+						id.Transport = "http"
+						id.SessionID, id.ClientSessionID = sessionID, sessionID
+						s.analytics.Record(ctx, s.analyticsEvent(id, "session.start", nil))
+					}
+					api.sessions.onEnd = func(ctx context.Context, sessionID string, duration time.Duration) {
+						id := s.identityFromContext(ctx)
+						id.Transport = "http"
+						id.SessionID, id.ClientSessionID = sessionID, sessionID
+						s.analytics.Record(ctx, s.analyticsEvent(id, "session.end", map[string]any{"duration_ms": duration.Milliseconds()}))
+					}
+				}
+				httpCfg.ExtraHandlers[apiPath+"/"] = s.authMiddleware(s.transportMiddleware(api.Handler(apiPath), "http"), httpAuthRequired)
 				s.logger.Info("HTTP API mounted", "path", apiPath, "http_port", s.config.HTTPPort)
 			}
 
@@ -1613,30 +1842,44 @@ func (s *Server) ListenAndServe() error {
 					}
 					return s.buildCanonicalSessionFS(id)
 				}, func(name, filePath string) ([]passkeys.FileHistoryEntry, error) {
-					if s.historyPath == "" {
+					if s.history == nil {
 						return nil, nil
 					}
 					id, ok := s.identityForName(name)
 					if !ok {
 						id = s.anonymousIdentity()
 					}
-					entries, err := (fileHistory{path: s.historyPath, roots: historyRoots(s.sessionDocsets(id))}).QueryFile(filePath)
+					page, err := s.history.Query(context.Background(), HistoryQuery{FileKey: filePath, Roots: historyRoots(s.sessionDocsets(id))})
 					if err != nil {
 						return nil, err
 					}
-					history := make([]passkeys.FileHistoryEntry, len(entries))
-					for i, entry := range entries {
+					history := make([]passkeys.FileHistoryEntry, len(page.Records))
+					for i, entry := range page.Records {
 						history[i] = passkeys.FileHistoryEntry{
-							Time: entry.Time, Attribution: entry.Attribution, Action: entry.Action, Hash: entry.Hash,
+							Time: entry.Time, Attribution: entry.Attribution.String(), Action: entry.Action, Hash: entry.ContentHash,
 						}
 					}
 					return history, nil
+				}, func(fsys vfs.FileSystem, path string) (passkeys.ContentFacts, error) {
+					if s.analytics == nil {
+						return passkeys.ContentFacts{}, fmt.Errorf("analytics disabled")
+					}
+					facts, err := s.analytics.NewContentFacts(fsys).Stat(context.Background(), path)
+					return passkeys.ContentFacts{Bytes: facts.Scalars["bytes"], Lines: facts.Scalars["lines"], Tokens: facts.Scalars["tokens"], Tokenizer: facts.Tokenizer}, err
 				})
 
 				cmds.PublishBaseURL = baseURL + lorePath
 			}
 
-			httpSrv, err := httpserver.New(webFS, httpCfg)
+			if frontend := assets.Dashboard(); frontend != nil {
+				// Preserve published file links, while replacing the primary
+				// browser rather than adding a second competing interface.
+				lorePath := s.dashboardLorePath()
+				httpCfg.ExtraHandlers[lorePath] = dashboardShell(frontend)
+				httpCfg.ExtraHandlers[lorePath+"/"] = s.dashboardLoreHandler(frontend)
+			}
+
+			httpSrv, err := httpserver.New(siteFS, httpCfg)
 			if err != nil {
 				return fmt.Errorf("creating HTTP server: %w", err)
 			}
@@ -1646,7 +1889,57 @@ func (s *Server) ListenAndServe() error {
 	}
 
 	s.logger.Info("SSH server starting", "port", s.config.Port)
+	s.startHistoryMaintenance()
 	return s.srv.ListenAndServe()
+}
+
+func (s *Server) startHistoryMaintenance() {
+	if s.historyPath == "" || s.historyCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.historyCancel = cancel
+	s.historyDone = make(chan struct{})
+	go func() {
+		defer close(s.historyDone)
+		maintain := func() {
+			var protected []HistoryPosition
+			if s.historyPosition != nil {
+				protected = append(protected, s.historyPosition())
+			}
+			if err := RotateCommitJournal(ctx, s.historyPath, time.Now().UTC(), s.config.Analytics.History.Retention, protected...); err != nil && !errors.Is(err, context.Canceled) {
+				s.logger.Warn("history journal maintenance failed", "err", err)
+			}
+		}
+		maintain()
+		for {
+			now := time.Now().UTC()
+			timer := time.NewTimer(now.Truncate(24 * time.Hour).Add(24 * time.Hour).Sub(now))
+			select {
+			case <-timer.C:
+				maintain()
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			}
+		}
+	}()
+}
+
+func (s *Server) metricsExportHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", s.analytics.Aggregator())
+	mux.HandleFunc("/metrics.json", func(w http.ResponseWriter, r *http.Request) {
+		request := r.Clone(r.Context())
+		request.URL.Path = "/metrics"
+		s.metrics.Handler().ServeHTTP(w, request)
+	})
+	return mux
 }
 
 // Shutdown gracefully shuts down the server.
@@ -1661,15 +1954,99 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			s.logger.Warn("shutdown: async jobs still running after drain timeout", "timeout", jobDrainTimeout)
 		}
 	}
-	// Stop accepting writes and drain the log so every acknowledged mutation
-	// commits before we exit (in-flight + queued entries still get their reply).
+	if s.httpSrv != nil {
+		_ = s.httpSrv.Shutdown(ctx)
+	}
+	if s.metricsSrv != nil {
+		_ = s.metricsSrv.Shutdown(ctx)
+	}
+	var transportErr error
+	if s.srv != nil {
+		transportErr = s.srv.Shutdown(ctx)
+	}
+	// Transports no longer accept commands. Drain writes next, then analytics
+	// last so every acknowledged command and commit can still emit.
+	if s.historyCancel != nil {
+		s.historyCancel()
+		select {
+		case <-s.historyDone:
+		case <-ctx.Done():
+			s.logger.Warn("shutdown: history maintenance did not stop before deadline", "err", ctx.Err())
+		}
+	}
 	if s.writeLog != nil {
 		if err := s.writeLog.Close(ctx); err != nil {
 			s.logger.Warn("shutdown: write log did not drain before deadline", "err", err)
 		}
 	}
-	if s.srv == nil {
-		return nil
+	if s.analytics != nil {
+		shutdownTimeout := s.config.Analytics.ShutdownTimeout
+		if shutdownTimeout <= 0 {
+			shutdownTimeout = 10 * time.Second
+		}
+		analyticsCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
+		if err := s.analytics.Close(analyticsCtx); err != nil {
+			s.logger.Warn("shutdown: analytics did not drain before deadline", "err", err)
+		}
+		cancel()
+		if s.analyticsCancel != nil {
+			s.analyticsCancel()
+		}
 	}
-	return s.srv.Shutdown(ctx)
+	return transportErr
+}
+
+func staticAppAsset(contentType string, content []byte) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write(content)
+		}
+	})
+}
+
+func (s *Server) openLoreMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	routes := map[string]string{"legal": "/legal/"}
+	ssh := map[string]any{"port": s.advertisedSSHPort()}
+	if s.config.HostKeyPath != "" {
+		routes["host_key"] = "/host-key"
+		ssh["host_key_url"] = "/host-key"
+	}
+	if assets.Dashboard() != nil {
+		routes["dashboard"] = "/dashboard/"
+		routes["lore"] = s.dashboardLorePath() + "/"
+	} else if s.passkeys != nil {
+		routes["lore"] = s.dashboardLorePath() + "/"
+	}
+	if s.passkeys != nil {
+		routes["login"] = "/passkey/login"
+	}
+	if s.config.MCPEnabled && s.config.MCPPath != "" {
+		routes["mcp"] = "/" + strings.Trim(s.config.MCPPath, "/")
+	}
+	if s.config.APIEnabled && s.config.APIPath != "" {
+		routes["api"] = "/" + strings.Trim(s.config.APIPath, "/") + "/"
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"version": assets.Version(),
+		"ssh":     ssh,
+		"routes": routes,
+	})
 }

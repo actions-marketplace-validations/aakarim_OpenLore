@@ -29,7 +29,7 @@ func TestRenderFileIncludesBreadcrumbsIframeAndParentCloseLink(t *testing.T) {
 
 	pk.renderFile(rec, req, "/lore", "/guides/setup.md", "adil", []FileHistoryEntry{{
 		Time: time.Date(2026, time.August, 19, 12, 30, 0, 0, time.UTC), Attribution: "adil/claude", Action: "write", Hash: "abc123",
-	}}, true)
+	}}, true, &ContentFacts{Bytes: 42, Lines: 3, Tokens: 11, Tokenizer: "approx"})
 
 	body := rec.Body.String()
 	for _, want := range []string{
@@ -42,16 +42,19 @@ func TestRenderFileIncludesBreadcrumbsIframeAndParentCloseLink(t *testing.T) {
 		`href="/lore/guides" aria-label="Close file and return to folder"`,
 		`src="/lore/guides/setup.md?raw=1"`,
 		`id="history-toggle"`,
-		`aria-controls="file-history" aria-expanded="true"`,
+		`aria-controls="file-history" aria-expanded="false"`,
+		`id="file-history" aria-label="Edit history" hidden`,
 		`<h2>Edit history</h2>`,
 		`class="history-action">write`,
 		`class="history-actor">adil/claude`,
 		`datetime="2026-08-19T12:30:00Z"`,
 		`title="abc123">abc123`,
-		`history.hidden=open`,
+		`setOpen(!window.matchMedia('(max-width:700px)').matches)`,
+		`history.hidden=!open`,
 		`id="identity-button"`,
 		`<span class="identity-name">adil</span>`,
 		`href="/settings/permissions">Permission settings`,
+		`42 bytes · 3 lines · ~11 tokens · approx`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("file view missing %q", want)
@@ -61,7 +64,7 @@ func TestRenderFileIncludesBreadcrumbsIframeAndParentCloseLink(t *testing.T) {
 
 func TestLoreBrowserServesPWAAssetsWithoutAuthentication(t *testing.T) {
 	pk := &Passkeys{cfg: Config{LorePath: "/knowledge"}}
-	handler := pk.LoreBrowserHandler(nil, nil)
+	handler := pk.LoreBrowserHandler(nil, nil, nil)
 
 	t.Run("manifest", func(t *testing.T) {
 		rec := httptest.NewRecorder()
@@ -98,7 +101,9 @@ func TestRenderDirUsesSingleTapActionsAndDoubleTapNavigation(t *testing.T) {
 	pk := &Passkeys{}
 	rec := httptest.NewRecorder()
 
-	pk.renderDir(rec, browserTestFS{}, "/lore", "/docs", "adil")
+	pk.renderDir(rec, browserTestFS{}, "/lore", "/docs", "adil", func(vfs.FileSystem, string) (ContentFacts, error) {
+		return ContentFacts{Bytes: 20, Lines: 2, Tokens: 5}, nil
+	})
 
 	body := rec.Body.String()
 	for _, want := range []string{
@@ -115,6 +120,7 @@ func TestRenderDirUsesSingleTapActionsAndDoubleTapNavigation(t *testing.T) {
 		`id="identity-button"`,
 		`<span class="identity-name">adil</span>`,
 		`href="/settings/permissions">Permission settings`,
+		`20 bytes · 2 lines · ~5 tokens`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("directory view missing %q", want)
@@ -150,5 +156,20 @@ func TestRenderMarkdownFormatsGFMAndDoesNotRenderRawHTML(t *testing.T) {
 	}
 	if got := rec.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
 		t.Errorf("Content-Type = %q", got)
+	}
+}
+
+func TestMarkdownFragmentCannotExecuteDocumentHTML(t *testing.T) {
+	fragment, err := RenderMarkdownFragment([]byte("---\ntitle: '<img src=x onerror=alert(1)>'\n---\n# Safe\n\n[link](javascript:alert%281%29)\n\n<script>alert(1)</script>\n\n![image](data:text/html;base64,PHNjcmlwdD4=)\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fragment, "<h1>Safe</h1>") || !strings.Contains(fragment, "&lt;img") {
+		t.Fatalf("missing rendered body or escaped frontmatter: %s", fragment)
+	}
+	for _, unsafe := range []string{"<script", "<img src=x", `href="javascript:`, `src="data:text/html`} {
+		if strings.Contains(fragment, unsafe) {
+			t.Fatalf("unsafe fragment contains %q: %s", unsafe, fragment)
+		}
 	}
 }

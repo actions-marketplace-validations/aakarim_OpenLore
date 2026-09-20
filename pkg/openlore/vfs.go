@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/aakarim/go-openlore/internal/config"
+	"github.com/aakarim/go-openlore/pkg/rules"
 	"github.com/aakarim/go-openlore/pkg/vfs"
 )
 
@@ -110,7 +111,8 @@ func (d *DirFS) PreflightChange(change vfs.Change) error {
 	}
 	p := change.Target
 	clean := vfs.CleanPath(p)
-	if isTrashPath(clean) || hasReservedPath(p) || hasTraversal(p) || isIgnored(p, d.files) {
+	dirConfig := isDirConfigPath(p)
+	if isTrashPath(clean) || (hasReservedPath(p) && !dirConfig) || hasTraversal(p) || (isIgnored(p, d.files) && !dirConfig) {
 		return fmt.Errorf("access denied: %s", p)
 	}
 	switch change.Action {
@@ -125,7 +127,7 @@ func (d *DirFS) PreflightChange(change vfs.Change) error {
 		if !change.Write.Opts.ContentPolicyValidated && int64(len(change.Write.Bytes)) > max {
 			return fmt.Errorf("write rejected: %d bytes exceeds limit of %d", len(change.Write.Bytes), max)
 		}
-		if !change.Write.Opts.ContentPolicyValidated && !isAllowed(path.Base(p), d.files) {
+		if !dirConfig && !change.Write.Opts.ContentPolicyValidated && !isAllowed(path.Base(p), d.files) {
 			return fmt.Errorf("access denied: %s", p)
 		}
 	case vfs.ChangeActionMkdir, vfs.ChangeActionMkdirAll:
@@ -145,6 +147,7 @@ func (d *DirFS) PreflightChange(change vfs.Change) error {
 // the read-current → check → swap sequence is atomic. Returns the hex SHA-256
 // of the committed bytes.
 func (d *DirFS) WriteFileAtomic(p string, content []byte, opts vfs.WriteOpts) (string, error) {
+	dirConfig := isDirConfigPath(p)
 	max := d.maxWriteBytes
 	if max == 0 {
 		max = defaultMaxWriteBytes
@@ -152,13 +155,13 @@ func (d *DirFS) WriteFileAtomic(p string, content []byte, opts vfs.WriteOpts) (s
 	if !opts.ContentPolicyValidated && int64(len(content)) > max {
 		return "", fmt.Errorf("write rejected: %d bytes exceeds limit of %d", len(content), max)
 	}
-	if isTrashPath(vfs.CleanPath(p)) || hasReservedPath(p) || hasTraversal(p) {
+	if isTrashPath(vfs.CleanPath(p)) || (hasReservedPath(p) && !dirConfig) || hasTraversal(p) {
 		return "", fmt.Errorf("access denied: %s", p)
 	}
-	if !opts.ContentPolicyValidated && !isAllowed(path.Base(p), d.files) {
+	if !dirConfig && !opts.ContentPolicyValidated && !isAllowed(path.Base(p), d.files) {
 		return "", fmt.Errorf("access denied: %s", p)
 	}
-	if isIgnored(p, d.files) {
+	if !dirConfig && isIgnored(p, d.files) {
 		return "", fmt.Errorf("access denied: %s", p)
 	}
 
@@ -280,6 +283,10 @@ func hasReservedPath(p string) bool {
 	return false
 }
 
+func isDirConfigPath(p string) bool {
+	return rules.IsDirConfigPath(p)
+}
+
 func hasTraversal(p string) bool {
 	for _, part := range strings.Split(strings.ReplaceAll(p, "\\", "/"), "/") {
 		if part == ".." {
@@ -374,10 +381,11 @@ func (d *DirFS) MkdirAll(p string) error {
 // root (or anything at/above one) and a non-empty directory.
 func (d *DirFS) Remove(p string) error {
 	clean := vfs.CleanPath(p)
+	dirConfig := isDirConfigPath(p)
 	if clean == "/" {
 		return fmt.Errorf("cannot delete docset root: %s", p)
 	}
-	if isTrashPath(clean) || hasReservedPath(p) || hasTraversal(p) || isIgnored(p, d.files) {
+	if isTrashPath(clean) || (hasReservedPath(p) && !dirConfig) || hasTraversal(p) || (isIgnored(p, d.files) && !dirConfig) {
 		return fmt.Errorf("access denied: %s", p)
 	}
 	if !d.insideDocset(clean) {
@@ -397,7 +405,7 @@ func (d *DirFS) Remove(p string) error {
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() && !isAllowed(info.Name(), d.files) {
+	if !dirConfig && !info.IsDir() && !isAllowed(info.Name(), d.files) {
 		return fmt.Errorf("access denied: %s", p)
 	}
 	if err := os.Remove(full); err != nil {
@@ -479,6 +487,20 @@ func (d *DirFS) rawSnapshot(clean, full string) (*vfs.TreeSnapshot, error) {
 		}
 		rel = filepath.ToSlash(rel)
 		if entry.IsDir() && entry.Name() == ".lore" {
+			configPath := filepath.Join(fp, "config.yaml")
+			info, err := os.Stat(configPath)
+			if err == nil && !info.IsDir() {
+				dirRel := filepath.ToSlash(filepath.Join(rel))
+				snap.Ops = append(snap.Ops, vfs.TreeOp{RelPath: dirRel, Kind: "dir"})
+				data, err := os.ReadFile(configPath)
+				if err != nil {
+					return err
+				}
+				sum := sha256.Sum256(data)
+				snap.Ops = append(snap.Ops, vfs.TreeOp{RelPath: path.Join(dirRel, "config.yaml"), Kind: "file", Hash: hex.EncodeToString(sum[:]), Size: int64(len(data))})
+			} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
 			return filepath.SkipDir
 		}
 		logical := clean
@@ -567,6 +589,9 @@ func (d *DirFS) resolve(p string) string {
 	return filepath.Join(d.root, filepath.FromSlash(p))
 }
 
+// HostDir maps a VFS directory to its writable on-disk backing for package state.
+func (d *DirFS) HostDir(p string) (string, bool) { return d.resolve(p), true }
+
 // currentHash returns the hex SHA-256 of the bytes currently at full, and
 // whether the file exists. A directory is treated as nonexistent for hashing.
 func currentHash(full string) (hash string, exists bool, err error) {
@@ -622,7 +647,19 @@ func atomicWrite(full string, content []byte) error {
 }
 
 func (d *DirFS) Stat(p string) (*vfs.FileInfo, error) {
-	if isTrashPath(vfs.CleanPath(p)) || hasReservedPath(p) || hasTraversal(p) {
+	clean := vfs.CleanPath(p)
+	if path.Base(clean) == ".lore" && !hasTraversal(p) && isDirConfigPath(path.Join(clean, "config.yaml")) {
+		if info, err := os.Stat(filepath.Join(d.resolve(clean), "config.yaml")); err != nil || info.IsDir() {
+			return nil, os.ErrNotExist
+		}
+		info, err := os.Stat(d.resolve(clean))
+		if err != nil {
+			return nil, err
+		}
+		return &vfs.FileInfo{FileName: ".lore", FilePath: clean, FileSize: info.Size(), FileModTime: info.ModTime(), Dir: true}, nil
+	}
+	dirConfig := isDirConfigPath(p)
+	if isTrashPath(clean) || (hasReservedPath(p) && !dirConfig) || hasTraversal(p) {
 		return nil, os.ErrNotExist
 	}
 	full := d.resolve(p)
@@ -631,11 +668,11 @@ func (d *DirFS) Stat(p string) (*vfs.FileInfo, error) {
 		return nil, err
 	}
 
-	if !info.IsDir() && !isAllowed(info.Name(), d.files) {
+	if !dirConfig && !info.IsDir() && !isAllowed(info.Name(), d.files) {
 		return nil, fmt.Errorf("access denied: %s", p)
 	}
 
-	if info.IsDir() && isIgnored(p, d.files) {
+	if !dirConfig && info.IsDir() && isIgnored(p, d.files) {
 		return nil, fmt.Errorf("access denied: %s", p)
 	}
 
@@ -649,7 +686,22 @@ func (d *DirFS) Stat(p string) (*vfs.FileInfo, error) {
 }
 
 func (d *DirFS) ReadDir(p string) ([]vfs.FileInfo, error) {
-	if isTrashPath(vfs.CleanPath(p)) || hasReservedPath(p) || hasTraversal(p) {
+	clean := vfs.CleanPath(p)
+	if path.Base(clean) == ".lore" && isDirConfigPath(path.Join(clean, "config.yaml")) {
+		if hasTraversal(p) {
+			return nil, os.ErrNotExist
+		}
+		configPath := path.Join(clean, "config.yaml")
+		info, err := os.Stat(d.resolve(configPath))
+		if err != nil {
+			return nil, err
+		}
+		if info.IsDir() {
+			return nil, os.ErrNotExist
+		}
+		return []vfs.FileInfo{{FileName: "config.yaml", FilePath: configPath, FileSize: info.Size(), FileModTime: info.ModTime()}}, nil
+	}
+	if isTrashPath(clean) || hasReservedPath(p) || hasTraversal(p) {
 		return nil, os.ErrNotExist
 	}
 	if isIgnored(p, d.files) {
@@ -665,6 +717,13 @@ func (d *DirFS) ReadDir(p string) ([]vfs.FileInfo, error) {
 	var result []vfs.FileInfo
 	for _, e := range entries {
 		if e.Name() == ".lore" {
+			configInfo, err := os.Stat(filepath.Join(full, ".lore", "config.yaml"))
+			if err == nil && !configInfo.IsDir() {
+				info, infoErr := e.Info()
+				if infoErr == nil {
+					result = append(result, vfs.FileInfo{FileName: ".lore", FilePath: path.Join(vfs.CleanPath(p), ".lore"), FileSize: info.Size(), FileModTime: info.ModTime(), Dir: true})
+				}
+			}
 			continue
 		}
 		childPath := path.Join(p, e.Name())
@@ -697,15 +756,32 @@ func (d *DirFS) ReadDir(p string) ([]vfs.FileInfo, error) {
 }
 
 func (d *DirFS) ReadFile(p string) ([]byte, error) {
-	if isTrashPath(vfs.CleanPath(p)) || hasReservedPath(p) || hasTraversal(p) {
+	dirConfig := isDirConfigPath(p)
+	if isTrashPath(vfs.CleanPath(p)) || (hasReservedPath(p) && !dirConfig) || hasTraversal(p) {
 		return nil, os.ErrNotExist
 	}
-	if !isAllowed(path.Base(p), d.files) {
+	if !dirConfig && !isAllowed(path.Base(p), d.files) {
 		return nil, fmt.Errorf("access denied: %s", p)
 	}
 
 	full := d.resolve(p)
 	return os.ReadFile(full)
+}
+
+func (d *DirFS) ReadFileBounded(p string, maxBytes int64) ([]byte, error) {
+	dirConfig := isDirConfigPath(p)
+	if isTrashPath(vfs.CleanPath(p)) || (hasReservedPath(p) && !dirConfig) || hasTraversal(p) {
+		return nil, os.ErrNotExist
+	}
+	if !dirConfig && !isAllowed(path.Base(p), d.files) {
+		return nil, fmt.Errorf("access denied: %s", p)
+	}
+	file, err := os.Open(d.resolve(p))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readAllBounded(file, maxBytes)
 }
 
 // MergeFS merges multiple filesystems under named mount points.
@@ -1040,7 +1116,20 @@ func (m *MergeFS) resolve(p string) (string, vfs.FileSystem, error) {
 		return "/" + p, m.root, nil
 	}
 
-	return "", nil, fmt.Errorf("not found: %s", p)
+	return "", nil, vfs.ErrNotFound(p)
+}
+
+// HostDir follows the same mount routing as content operations.
+func (m *MergeFS) HostDir(p string) (string, bool) {
+	sub, backend, err := m.resolve(p)
+	if err != nil || backend == nil {
+		return "", false
+	}
+	mapper, ok := backend.(interface{ HostDir(string) (string, bool) })
+	if !ok {
+		return "", false
+	}
+	return mapper.HostDir(sub)
 }
 
 func (m *MergeFS) Stat(p string) (*vfs.FileInfo, error) {
@@ -1100,6 +1189,17 @@ func (m *MergeFS) ReadFile(p string) ([]byte, error) {
 	}
 
 	return fsys.ReadFile(subPath)
+}
+
+func (m *MergeFS) ReadFileBounded(p string, maxBytes int64) ([]byte, error) {
+	subPath, fsys, err := m.resolve(p)
+	if err != nil {
+		return nil, err
+	}
+	if fsys == nil {
+		return nil, fmt.Errorf("cannot read directory")
+	}
+	return readFileBounded(fsys, subPath, maxBytes)
 }
 
 // EmbedFS serves files from an embed.FS.
@@ -1191,6 +1291,18 @@ func (e *EmbedFS) ReadFile(p string) ([]byte, error) {
 
 	full := e.resolve(p)
 	return e.fs.ReadFile(full)
+}
+
+func (e *EmbedFS) ReadFileBounded(p string, maxBytes int64) ([]byte, error) {
+	if !isAllowed(path.Base(p), e.files) {
+		return nil, fmt.Errorf("access denied: %s", p)
+	}
+	file, err := e.fs.Open(e.resolve(p))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readAllBounded(file, maxBytes)
 }
 
 // isAllowed checks if a filename matches the allowed patterns (and is not denied).
@@ -1300,6 +1412,19 @@ func (a *FSAdapter) ReadFile(p string) ([]byte, error) {
 		p = "."
 	}
 	return fs.ReadFile(a.fsys, p)
+}
+
+func (a *FSAdapter) ReadFileBounded(p string, maxBytes int64) ([]byte, error) {
+	p = strings.TrimPrefix(path.Clean("/"+p), "/")
+	if p == "" {
+		p = "."
+	}
+	file, err := a.fsys.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readAllBounded(file, maxBytes)
 }
 
 // Ensure all types implement vfs.FileSystem; DirFS and MergeFS are writable.
